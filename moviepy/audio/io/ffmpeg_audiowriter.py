@@ -160,15 +160,27 @@ class FFMPEG_AudioWriter:
 
     def close(self):
         """Closes the writer, terminating the subprocess if is still alive."""
-        if hasattr(self, "proc") and self.proc:
-            self.proc.stdin.close()
-            self.proc.stdin = None
-            if self.proc.stderr is not None:
-                self.proc.stderr.close()
-                self.proc.stderr = None
-            # If this causes deadlocks, consider terminating instead.
-            self.proc.wait()
-            self.proc = None
+        proc = getattr(self, "proc", None)
+        if proc is None:
+            return
+        self.proc = None
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        proc.stdin = None
+        try:
+            if proc.stderr is not None:
+                proc.stderr.close()
+        except OSError:
+            pass
+        proc.stderr = None
+        # If this causes deadlocks, consider terminating instead.
+        try:
+            proc.wait()
+        except OSError:
+            pass
 
     def __del__(self):
         # If the garbage collector comes, make sure the subprocess is terminated.
@@ -206,24 +218,32 @@ def ffmpeg_audiowrite(
         logfile = None
     logger = proglog.default_bar_logger(logger)
     logger(message="MoviePy - Writing audio in %s" % filename)
-    writer = FFMPEG_AudioWriter(
-        filename,
-        fps,
-        nbytes,
-        clip.nchannels,
-        codec=codec,
-        bitrate=bitrate,
-        logfile=logfile,
-        ffmpeg_params=ffmpeg_params,
-    )
-
-    for chunk in clip.iter_chunks(
-        chunksize=buffersize, quantize=True, nbytes=nbytes, fps=fps, logger=logger
-    ):
-        writer.write_frames(chunk)
-
-    writer.close()
-
-    if write_logfile:
-        logfile.close()
+    try:
+        writer = FFMPEG_AudioWriter(
+            filename,
+            fps,
+            nbytes,
+            clip.nchannels,
+            codec=codec,
+            bitrate=bitrate,
+            logfile=logfile,
+            ffmpeg_params=ffmpeg_params,
+        )
+        try:
+            for chunk in clip.iter_chunks(
+                chunksize=buffersize,
+                quantize=True,
+                nbytes=nbytes,
+                fps=fps,
+                logger=logger,
+            ):
+                writer.write_frames(chunk)
+        finally:
+            writer.close()
+    finally:
+        if write_logfile:
+            try:
+                logfile.close()
+            except OSError:
+                pass
     logger(message="MoviePy - Done.")

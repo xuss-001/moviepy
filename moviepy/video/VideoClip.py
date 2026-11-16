@@ -375,40 +375,43 @@ class VideoClip(Clip):
         # enough cpu for multiprocessing ? USELESS RIGHT NOW, WILL COME AGAIN
         # enough_cpu = (multiprocessing.cpu_count() > 1)
         logger(message="MoviePy - Building video %s." % filename)
-        if make_audio:
-            self.audio.write_audiofile(
-                audiofile,
-                audio_fps,
-                audio_nbytes,
-                audio_bufsize,
-                audio_codec,
-                bitrate=audio_bitrate,
+        try:
+            if make_audio:
+                self.audio.write_audiofile(
+                    audiofile,
+                    audio_fps,
+                    audio_nbytes,
+                    audio_bufsize,
+                    audio_codec,
+                    bitrate=audio_bitrate,
+                    write_logfile=write_logfile,
+                    logger=logger,
+                )
+                # The audio is already encoded,
+                # so there is no need to encode it during video export
+                audio_codec = "copy"
+
+            ffmpeg_write_video(
+                self,
+                filename,
+                fps,
+                codec,
+                bitrate=bitrate,
+                preset=preset,
                 write_logfile=write_logfile,
+                audiofile=audiofile,
+                audio_codec=audio_codec,
+                threads=threads,
+                ffmpeg_params=ffmpeg_params,
                 logger=logger,
+                pixel_format=pixel_format,
             )
-            # The audio is already encoded,
-            # so there is no need to encode it during video export
-            audio_codec = "copy"
-
-        ffmpeg_write_video(
-            self,
-            filename,
-            fps,
-            codec,
-            bitrate=bitrate,
-            preset=preset,
-            write_logfile=write_logfile,
-            audiofile=audiofile,
-            audio_codec=audio_codec,
-            threads=threads,
-            ffmpeg_params=ffmpeg_params,
-            logger=logger,
-            pixel_format=pixel_format,
-        )
-
-        if remove_temp and make_audio:
-            if os.path.exists(audiofile):
-                os.remove(audiofile)
+        finally:
+            if remove_temp and make_audio and os.path.exists(audiofile):
+                try:
+                    os.remove(audiofile)
+                except OSError:
+                    pass
         logger(message="MoviePy - video ready %s" % filename)
 
     @requires_duration
