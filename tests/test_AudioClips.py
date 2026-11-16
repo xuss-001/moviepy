@@ -1,6 +1,7 @@
 """Image sequencing clip tests meant to be run with pytest."""
 
 import os
+import subprocess
 
 import numpy as np
 
@@ -13,6 +14,9 @@ from moviepy.audio.AudioClip import (
     concatenate_audioclips,
 )
 from moviepy.audio.io.AudioFileClip import AudioFileClip
+from moviepy.audio.io.readers import FFMPEG_AudioReader
+from moviepy.config import FFMPEG_BINARY
+from moviepy.tools import ffmpeg_escape_filename
 
 
 def test_audioclip(util, mono_wave):
@@ -218,6 +222,223 @@ def test_audioclip_stereo_max_volume(nchannels, channel_muted):
                 assert channel_max_volume == 0
             else:
                 assert channel_max_volume > 0
+
+
+def _make_tone_wav(util, frequency, fps=44100, duration=1.0):
+    """Create a mono sine wave wav file and return its path."""
+    filename = os.path.join(util.TMP_DIR, "tone_%dhz.wav" % frequency)
+
+    def frame_function(t, frequency=frequency):
+        return np.sin(2 * np.pi * frequency * np.asarray(t, dtype=float))
+
+    AudioClip(frame_function, duration=duration, fps=fps).write_audiofile(
+        filename, logger=None, codec="pcm_s16le"
+    )
+    return filename
+
+
+def _dominant_frequency(signal, fps):
+    """Return the dominant non-zero frequency of a 1D signal."""
+    spectrum = np.abs(np.fft.rfft(signal))
+    frequencies = np.fft.rfftfreq(len(signal), 1.0 / fps)
+    return frequencies[np.argmax(spectrum[1:]) + 1]
+
+
+def test_audio_reader_empty_time_array(util):
+    """An empty time array returns zero rows but keeps the channel count."""
+    reader = FFMPEG_AudioReader("media/crunching.mp3", buffersize=1000)
+    try:
+        frames = reader.get_frame(np.array([]))
+        assert frames.shape == (0, reader.nchannels)
+    finally:
+        reader.close()
+
+
+def test_audio_reader_out_of_time_returns_silence(util):
+    """Negative and beyond-duration requests return silence, never an error."""
+    filename = _make_tone_wav(util, 440)
+    reader = FFMPEG_AudioReader(filename, buffersize=1000)
+    try:
+        duration = reader.duration
+
+        # all requests out of range: the result is fully silent
+        frames = reader.get_frame(np.array([-1.0, -0.001, duration, duration + 2]))
+        assert frames.shape == (4, reader.nchannels)
+        assert (frames == 0).all()
+
+        # mixed in-range and out-of-range requests keep their request order
+        times = np.array([-0.5, 0.25, duration, 0.75, duration + 1.0])
+        mixed = reader.get_frame(times)
+        assert mixed.shape == (5, reader.nchannels)
+        assert (mixed[[0, 2, 4]] == 0).all()
+        # in-range rows match point-by-point reads (0.25s and 0.75s happen
+        # to be exact zero crossings of the 440 Hz sine)
+        np.testing.assert_array_equal(
+            mixed[[1, 3]],
+            np.stack([reader.get_frame(0.25), reader.get_frame(0.75)]),
+        )
+
+        # scalar requests are silent too, as a single 1D frame
+        assert reader.get_frame(-1.0).shape == (reader.nchannels,)
+        assert (reader.get_frame(-1.0) == 0).all()
+        assert (reader.get_frame(duration) == 0).all()
+    finally:
+        reader.close()
+
+
+def test_audio_reader_shuffled_duplicated_times_match_single_reads(util):
+    """Batch reads follow the request order, keep duplicates and match the
+    point-by-point reads regardless of the previous reading position.
+    """
+    filename = _make_tone_wav(util, 440)
+    small_buffer_reader = FFMPEG_AudioReader(filename, buffersize=120)
+    reference_reader = FFMPEG_AudioReader(filename, buffersize=120)
+    try:
+        duration = small_buffer_reader.duration
+        times = np.array(
+            [0.8, 0.1, 0.55, 0.1, 0.9, 0.8, 0.0, 0.35, 0.55, duration]
+        )
+
+        batch_frames = small_buffer_reader.get_frame(times)
+        single_frames = np.stack(
+            [reference_reader.get_frame(float(t)) for t in times]
+        )
+        np.testing.assert_array_equal(batch_frames, single_frames)
+
+        # duplicates are preserved row for row
+        repeated_times = np.repeat(np.linspace(0.2, 0.3, 10), 7)
+        repeated_frames = small_buffer_reader.get_frame(repeated_times)
+        reference_frames = np.stack(
+            [reference_reader.get_frame(float(t)) for t in repeated_times]
+        )
+        np.testing.assert_array_equal(repeated_frames, reference_frames)
+
+        # jumping back and forth does not depend on the previous position
+        for _ in range(3):
+            jumping_times = np.array([0.95, 0.02, 0.7, 0.02, 0.95, 0.4])
+            jumping_frames = small_buffer_reader.get_frame(jumping_times)
+            reference_jumping = np.stack(
+                [reference_reader.get_frame(float(t)) for t in jumping_times]
+            )
+            np.testing.assert_array_equal(jumping_frames, reference_jumping)
+    finally:
+        small_buffer_reader.close()
+        reference_reader.close()
+
+
+def test_audio_reader_scalar_and_array_share_rounding_rule(util):
+    """Single-point and batch sampling use the same sample-point rule."""
+    filename = _make_tone_wav(util, 440)
+    reader = FFMPEG_AudioReader(filename, buffersize=200)
+    try:
+        # half a sample at 44100 fps rounds to the next sample in both paths
+        half_sample_time = 0.5 / reader.fps
+        scalar_frame = reader.get_frame(half_sample_time)
+        array_frame = reader.get_frame(np.array([half_sample_time]))[0]
+        np.testing.assert_array_equal(scalar_frame, array_frame)
+
+        # the last valid sample is one frame before the file duration
+        last_time = (reader.n_frames - 1) / reader.fps
+        assert (reader.get_frame(np.array([last_time])) != 0).any()
+    finally:
+        reader.close()
+
+
+def test_audio_reader_batches_do_not_restart_ffmpeg_per_time(util):
+    """Dense or repeated requests reuse the streaming buffer."""
+    filename = _make_tone_wav(util, 440)
+    reader = FFMPEG_AudioReader(filename, buffersize=200)
+    try:
+        restarts = 0
+        original_initialize = reader.initialize
+
+        def counting_initialize(*args, **kwargs):
+            nonlocal restarts
+            restarts += 1
+            return original_initialize(*args, **kwargs)
+
+        reader.initialize = counting_initialize
+
+        # 500 requests with many duplicates, all within one buffer window
+        times = np.repeat(np.linspace(0.2, 0.202, 100), 5)
+        frames = reader.get_frame(times)
+        assert frames.shape == (500, reader.nchannels)
+        assert restarts == 0
+
+        # adjacent forward reads stream new chunks without reopening ffmpeg
+        reader.get_frame(np.linspace(0.3, 0.35, 200))
+        assert restarts == 0
+    finally:
+        reader.close()
+
+
+def test_audio_reader_audio_stream_index_is_stable(util):
+    """The selected audio track survives jumps, zero seeks and process restarts."""
+    fps = 44100
+    track_440 = _make_tone_wav(util, 440, fps=fps)
+    track_880 = _make_tone_wav(util, 880, fps=fps)
+    dual_track_filepath = os.path.join(util.TMP_DIR, "dual_audio_stream.mkv")
+
+    cmd = [
+        FFMPEG_BINARY,
+        "-y",
+        "-i",
+        ffmpeg_escape_filename(track_440),
+        "-i",
+        ffmpeg_escape_filename(track_880),
+        "-map",
+        "0:a:0",
+        "-map",
+        "1:a:0",
+        "-c",
+        "copy",
+        ffmpeg_escape_filename(dual_track_filepath),
+    ]
+    with open(os.devnull, "w") as stderr:
+        subprocess.check_call(cmd, stderr=stderr)
+
+    # a small buffer forces frequent buffer recenters while jumping around
+    reader = FFMPEG_AudioReader(
+        dual_track_filepath, buffersize=80, fps=fps, audio_stream_index=1
+    )
+    probe_times = np.linspace(0.3, 0.4, 4410, endpoint=False)
+    try:
+        assert reader.audio_stream_index == 1
+
+        shuffled_times = np.array([0.9, 0.05, 0.6, 0.05, 0.9, 0.3])
+        reader.get_frame(shuffled_times)
+        assert _dominant_frequency(reader.get_frame(probe_times)[:, 0], fps) == 880
+
+        # going back to zero triggers a fresh ffmpeg process
+        reader.seek(0)
+        reader.buffer_around(1)
+        assert _dominant_frequency(reader.get_frame(probe_times)[:, 0], fps) == 880
+
+        # explicitly reopening the decoder must still map the second track
+        reader.initialize(0.0)
+        reader.buffer_around(1)
+        assert _dominant_frequency(reader.get_frame(probe_times)[:, 0], fps) == 880
+
+        reader.initialize(0.5)
+        reader.buffer_around(int(0.35 * fps))
+        assert _dominant_frequency(reader.get_frame(probe_times)[:, 0], fps) == 880
+    finally:
+        reader.close()
+
+    # without an explicit index, the default keeps selecting track 0
+    default_reader = FFMPEG_AudioReader(
+        dual_track_filepath, buffersize=80, fps=fps
+    )
+    try:
+        assert default_reader.audio_stream_index == 0
+        default_reader.seek(0)
+        default_reader.buffer_around(1)
+        assert (
+            _dominant_frequency(default_reader.get_frame(probe_times)[:, 0], fps)
+            == 440
+        )
+    finally:
+        default_reader.close()
 
 
 if __name__ == "__main__":
