@@ -26,6 +26,13 @@ class AudioFileClip(AudioClip):
     buffersize:
       Size to load in memory (in number of frames)
 
+    nchannels:
+      Number of audio channels to read from the file. The sound is
+      converted to this number of channels when reading (default is 2,
+      i.e. stereo). Set it to the actual number of channels of your
+      file (e.g. 1 for mono, 3 or 6 for multi-channel sounds) to
+      preserve all the channels instead of downmixing them to stereo.
+
 
     Attributes
     ----------
@@ -66,6 +73,7 @@ class AudioFileClip(AudioClip):
         buffersize=200000,
         nbytes=2,
         fps=44100,
+        nchannels=2,
         audio_stream_index=0,
     ):
         AudioClip.__init__(self)
@@ -76,6 +84,7 @@ class AudioFileClip(AudioClip):
             decode_file=decode_file,
             fps=fps,
             nbytes=nbytes,
+            nchannels=nchannels,
             buffersize=buffersize,
             audio_stream_index=audio_stream_index,
         )

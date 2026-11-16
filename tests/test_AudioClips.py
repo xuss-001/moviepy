@@ -183,6 +183,190 @@ def test_audioclip_mono_max_volume(mono_wave):
     assert max_volume > 0
 
 
+def make_multichannel_array(nchannels, fps=1000, duration=1.0):
+    """Return an array of shape (n, nchannels) where each channel holds
+    a different content, so that channel order can be checked."""
+    tt = np.arange(0, duration, 1.0 / fps)
+    return np.column_stack(
+        [
+            0.5 * np.sin(2 * np.pi * (channel + 1) * 10 * tt)
+            for channel in range(nchannels)
+        ]
+    )
+
+
+@pytest.mark.parametrize("nchannels", (1, 2, 3, 6))
+def test_audioarrayclip_multichannel_consistency(nchannels):
+    """AudioArrayClip must preserve content, order, total number of frames
+    and number of channels for single-frame sampling, batch sampling and
+    chunked conversion, whatever the number of channels.
+    """
+    fps = 1000
+    array = make_multichannel_array(nchannels, fps=fps)
+    clip = AudioArrayClip(array, fps=fps)
+
+    assert clip.nchannels == nchannels
+
+    # single frame sampling
+    frame = clip.get_frame(0.5)
+    assert frame.shape == (nchannels,)
+    np.testing.assert_array_equal(frame, array[int(0.5 * fps)])
+
+    # batch sampling
+    frames = clip.get_frame(np.array([0.0, 0.1, 0.5]))
+    assert frames.shape == (3, nchannels)
+    np.testing.assert_array_equal(frames, array[[0, 100, 500]])
+
+    # full conversion in one shot
+    sound = clip.to_soundarray()
+    assert sound.shape == (len(array), nchannels)
+    np.testing.assert_array_equal(sound, array)
+
+    # full conversion by chunks (duration > buffersize / fps)
+    sound = clip.to_soundarray(buffersize=300)
+    assert sound.shape == (len(array), nchannels)
+    np.testing.assert_array_equal(sound, array)
+
+    # chunked conversion, with a last chunk smaller than chunksize
+    chunks = list(clip.iter_chunks(chunksize=400))
+    assert sum(len(chunk) for chunk in chunks) == len(array)
+    assert all(len(chunk) <= 400 for chunk in chunks)
+    assert len(chunks[-1]) < 400
+    for chunk in chunks:
+        assert chunk.shape == (len(chunk), nchannels)
+    np.testing.assert_array_equal(np.vstack(chunks), array)
+
+    # out of bounds sampling returns silence with the same number of channels
+    for t in (-1.0, 2 * clip.duration):
+        frame = clip.get_frame(t)
+        assert frame.shape == (nchannels,)
+        assert (frame == 0).all()
+
+    frames = clip.get_frame(np.array([-1.0, 0.5, 2 * clip.duration]))
+    assert frames.shape == (3, nchannels)
+    assert (frames[0] == 0).all()
+    assert (frames[2] == 0).all()
+    np.testing.assert_array_equal(frames[1], array[int(0.5 * fps)])
+
+
+def test_audioarrayclip_2d_mono_keeps_single_column():
+    """A 2D mono array (Nx1) must keep exactly one column, it must not
+    be expanded to two channels.
+    """
+    fps = 1000
+    array = make_multichannel_array(1, fps=fps)
+    assert array.shape[1] == 1
+
+    clip = AudioArrayClip(array, fps=fps)
+    assert clip.nchannels == 1
+
+    assert clip.get_frame(0.5).shape == (1,)
+    assert clip.get_frame(np.array([0.0, 0.5])).shape == (2, 1)
+    assert clip.to_soundarray().shape == (len(array), 1)
+    np.testing.assert_array_equal(clip.to_soundarray(), array)
+
+
+def test_audioarrayclip_1d_mono_array():
+    """1D arrays are mono sounds and must keep working."""
+    fps = 1000
+    tt = np.arange(0, 1.0, 1.0 / fps)
+    array = np.sin(2 * np.pi * 10 * tt)
+
+    clip = AudioArrayClip(array, fps=fps)
+    assert clip.nchannels == 1
+
+    sound = clip.to_soundarray()
+    assert sound.shape == (len(array), 1)
+    np.testing.assert_array_equal(sound[:, 0], array)
+
+
+def test_audioarrayclip_invalid_array_raises():
+    """Arrays that cannot represent a sound must raise a clear error."""
+    with pytest.raises(ValueError):
+        AudioArrayClip(np.zeros((10, 2, 2)), fps=1000)
+
+    with pytest.raises(ValueError):
+        AudioArrayClip(np.array(1.0), fps=1000)
+
+
+def test_audioclip_mono_frame_function_chunked(mono_wave):
+    """Mono clips built from a frame function returning scalar (1D mono)
+    values must keep working when converted by chunks."""
+    clip = AudioClip(mono_wave(440), duration=2, fps=44100)
+    assert clip.nchannels == 1
+
+    sound = clip.to_soundarray(buffersize=5000)
+    expected = mono_wave(440)(np.arange(0, 2, 1.0 / 44100))
+    assert sound.shape == expected.shape
+    np.testing.assert_array_almost_equal(sound, expected)
+
+
+@pytest.mark.parametrize(("nbytes", "dtype"), ((2, "int16"), (4, "int32")))
+def test_iter_chunks_quantize_nbytes(nbytes, dtype):
+    """Quantization depth of chunked conversions must follow ``nbytes``
+    and must not depend on the chunking."""
+    fps = 1000
+    array = make_multichannel_array(2, fps=fps)
+    clip = AudioArrayClip(array, fps=fps)
+
+    for chunk in clip.iter_chunks(chunksize=400, quantize=True, nbytes=nbytes):
+        assert chunk.dtype == np.dtype(dtype)
+
+    sound = clip.to_soundarray(buffersize=300, quantize=True, nbytes=nbytes)
+    assert sound.dtype == np.dtype(dtype)
+    assert sound.shape == (len(array), 2)
+
+    # chunked and non-chunked quantized conversions must be identical
+    sound_direct = clip.to_soundarray(quantize=True, nbytes=nbytes)
+    np.testing.assert_array_equal(sound, sound_direct)
+
+
+@pytest.mark.parametrize("nchannels", (1, 2, 3, 6))
+@pytest.mark.parametrize(("nbytes", "codec"), ((2, "pcm_s16le"), (4, "pcm_s32le")))
+def test_audiofileclip_multichannel_wav_roundtrip(util, nchannels, nbytes, codec):
+    """Write a WAV file (16-bit and 32-bit PCM) whose channels all have a
+    different content, read it back with the same number of channels and
+    check that content and channel order are preserved within the
+    quantization precision.
+    """
+    fps = 44100
+    array = make_multichannel_array(nchannels, fps=fps, duration=0.5)
+    filename = os.path.join(
+        util.TMP_DIR, "roundtrip_%dch_%dbit.wav" % (nchannels, 8 * nbytes)
+    )
+
+    clip = AudioArrayClip(array, fps=fps)
+    clip.write_audiofile(filename, nbytes=nbytes, codec=codec, logger=None)
+
+    read_clip = AudioFileClip(filename, nchannels=nchannels, nbytes=nbytes)
+    try:
+        assert read_clip.nchannels == nchannels
+        output = read_clip.to_soundarray()
+    finally:
+        read_clip.close()
+
+    output = output[: len(array)]
+    assert output.shape == (len(array), nchannels)
+    # error must be within the quantization precision (1 LSB)
+    np.testing.assert_allclose(output, array, atol=1.0 / 2 ** (8 * nbytes - 1))
+
+
+def test_audiofileclip_default_nchannels_is_stereo(util):
+    """AudioFileClip reads two channels by default."""
+    filename = os.path.join(util.TMP_DIR, "default_nchannels.wav")
+    array = make_multichannel_array(2, fps=44100, duration=0.1)
+    AudioArrayClip(array, fps=44100).write_audiofile(
+        filename, codec="pcm_s16le", logger=None
+    )
+
+    clip = AudioFileClip(filename)
+    try:
+        assert clip.nchannels == 2
+        assert clip.get_frame(0.05).shape == (2,)
+    finally:
+        clip.close()
+
+
 @pytest.mark.parametrize(("nchannels"), (2, 4, 8, 16))
 @pytest.mark.parametrize(("channel_muted"), ("left", "right"))
 def test_audioclip_stereo_max_volume(nchannels, channel_muted):

@@ -25,6 +25,8 @@ class AudioClip(Clip):
     An AudioClip is a Clip with a ``frame_function``  attribute of
     the form `` t -> [ f_t ]`` for mono sound and
     ``t-> [ f1_t, f2_t ]`` for stereo sound (the arrays are Numpy arrays).
+    More generally, the frame at time ``t`` is an array of ``nchannels``
+    floats, one per channel, so any number of channels is supported.
     The `f_t` are floats between -1 and 1. These bounds can be
     trespassed without problems (the program will put the
     sound back into the bounds at conversion time, without much impact).
@@ -42,7 +44,8 @@ class AudioClip(Clip):
       this case their duration will be ``None``.
 
     nchannels
-      Number of channels (one or two for mono or stereo).
+      Number of channels (one for mono, two for stereo, or any other
+      number for multi-channel sound).
 
     Examples
     --------
@@ -92,7 +95,15 @@ class AudioClip(Clip):
         nbytes=2,
         logger=None,
     ):
-        """Iterator that returns the whole sound array of the clip by chunks"""
+        """Iterator that returns the whole sound array of the clip by chunks.
+
+        Each chunk is an array of shape ``(chunksize, nchannels)`` (or
+        ``(chunksize,)`` for mono clips whose frames are scalars), except
+        the last chunk, which may be shorter when the total number of
+        frames is not a multiple of ``chunksize``. The number of channels
+        and the sample order are preserved across chunks, and ``nbytes``
+        sets the quantization depth of every chunk when ``quantize=True``.
+        """
         if fps is None:
             fps = self.fps
         logger = proglog.default_bar_logger(logger)
@@ -121,6 +132,11 @@ class AudioClip(Clip):
         Transforms the sound into an array that can be played by pygame
         or written in a wav file. See ``AudioClip.preview``.
 
+        The returned array has one row per sample time and one column per
+        channel, so a sound with ``nchannels`` channels gives an array of
+        shape ``(len(tt), nchannels)`` (mono clips whose frames are scalars
+        keep returning 1D arrays of shape ``(len(tt),)``).
+
         Parameters
         ----------
 
@@ -137,16 +153,20 @@ class AudioClip(Clip):
             if fps is None:
                 fps = self.fps
 
-            max_duration = 1 * buffersize / fps
+            max_duration = 1.0 * buffersize / fps
             if self.duration > max_duration:
-                stacker = np.vstack if self.nchannels == 2 else np.hstack
-                return stacker(
-                    tuple(
-                        self.iter_chunks(
-                            fps=fps, quantize=quantize, nbytes=2, chunksize=buffersize
-                        )
+                chunks = tuple(
+                    self.iter_chunks(
+                        fps=fps,
+                        quantize=quantize,
+                        nbytes=nbytes,
+                        chunksize=buffersize,
                     )
                 )
+                if chunks[0].ndim == 1:
+                    # mono sound rendered as 1D chunks
+                    return np.concatenate(chunks)
+                return np.vstack(chunks)
             else:
                 tt = np.arange(0, self.duration, 1.0 / fps)
         """
@@ -323,7 +343,11 @@ class AudioArrayClip(AudioClip):
 
     array
       A Numpy array representing the sound, of size Nx1 for mono,
-      Nx2 for stereo.
+      Nx2 for stereo, and more generally NxM for a sound with M channels
+      (one row per sample time, one column per channel). A 1D array of
+      size N is also accepted and treated as mono sound. Arrays with
+      more than 2 dimensions cannot represent a sound and raise a
+      ``ValueError``.
 
     fps
       Frames per second : speed at which the sound is supposed to be
@@ -333,9 +357,20 @@ class AudioArrayClip(AudioClip):
 
     def __init__(self, array, fps):
         Clip.__init__(self)
-        self.array = array
+        self.array = np.asarray(array)
+        if self.array.ndim == 1:
+            # 1D arrays are mono sounds, keep them as a single column
+            # so that sampling always returns one value per channel.
+            self.array = self.array.reshape((-1, 1))
+        elif self.array.ndim != 2:
+            raise ValueError(
+                "AudioArrayClip expects a 1D (mono) or 2D (one column per "
+                "channel) array, got an array with %d dimensions."
+                % self.array.ndim
+            )
         self.fps = fps
-        self.duration = 1.0 * len(array) / fps
+        self.duration = 1.0 * len(self.array) / fps
+        self.nchannels = self.array.shape[1]
 
         def frame_function(t):
             """Complicated, but must be able to handle the case where t
@@ -344,7 +379,7 @@ class AudioArrayClip(AudioClip):
             if isinstance(t, np.ndarray):
                 array_inds = np.round(self.fps * t).astype(int)
                 in_array = (array_inds >= 0) & (array_inds < len(self.array))
-                result = np.zeros((len(t), 2))
+                result = np.zeros((len(t), self.nchannels))
                 result[in_array] = self.array[array_inds[in_array]]
                 return result
             else:
@@ -355,7 +390,6 @@ class AudioArrayClip(AudioClip):
                     return self.array[i]
 
         self.frame_function = frame_function
-        self.nchannels = len(list(self.get_frame(0)))
 
 
 class CompositeAudioClip(AudioClip):

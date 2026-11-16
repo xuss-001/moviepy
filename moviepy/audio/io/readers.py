@@ -37,6 +37,10 @@ class FFMPEG_AudioReader:
       Desired number of bytes (1,2,4) in the signal that will be
       received from ffmpeg
 
+    nchannels
+      Desired number of channels (1 for mono, 2 for stereo, etc.) in the
+      signal that will be received from ffmpeg
+
     audio_stream_index
       The index of the audio stream to read from the file.
     """
@@ -228,14 +232,16 @@ class FFMPEG_AudioReader:
 
             # if min and max frames don't fit the buffer, it results in IndexError
             # we avoid that by recursively calling this function on smaller length
-            # and concatenate the results:w
+            # and concatenate the results
             max_frame_threshold = fr_min + self.buffersize // 2
             threshold_idx = np.searchsorted(frames, max_frame_threshold, side="right")
             if threshold_idx != len(frames):
-                in_time_head = in_time[0:threshold_idx]
-                in_time_tail = in_time[threshold_idx:]
+                # ``threshold_idx`` only counts the in-time frames, convert it
+                # back to a position in ``tt`` so that out-of-time entries
+                # stay at their place (as zeros) in the final result.
+                split_idx = np.nonzero(in_time)[0][threshold_idx]
                 return np.concatenate(
-                    [self.get_frame(in_time_head), self.get_frame(in_time_tail)]
+                    [self.get_frame(tt[:split_idx]), self.get_frame(tt[split_idx:])]
                 )
 
             if not (0 <= (fr_min - self.buffer_startframe) < len(self.buffer)):
