@@ -1153,6 +1153,7 @@ class VideoClip(Clip):
         center: tuple = None,
         translate: tuple = None,
         bg_color: tuple = None,
+        canvas_size: tuple = None,
     ):
         """Rotates the specified clip by ``angle`` degrees (or radians) anticlockwise
         If the angle is not a multiple of 90 (degrees) or ``center``, ``translate``,
@@ -1169,6 +1170,7 @@ class VideoClip(Clip):
                     center=center,
                     translate=translate,
                     bg_color=bg_color,
+                    canvas_size=canvas_size,
                 )
             ]
         )

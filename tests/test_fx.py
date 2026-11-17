@@ -963,6 +963,166 @@ def test_rotate_mask():
     assert clip.get_frame(0)[1][1] != 0
 
 
+def _marker_clip():
+    """Return a 100x60 RGB ImageClip with a red 5x5 marker centered on (11, 21)."""
+    img = np.zeros((60, 100, 3), dtype=np.uint8)
+    img[19:24, 9:14] = (255, 0, 0)
+    return ImageClip(img).with_duration(1).with_fps(10)
+
+
+def test_rotate_canvas_size_is_constant():
+    """The whole animation keeps the fixed canvas size, for frames and masks."""
+    clip = _marker_clip().with_effects(
+        [
+            vfx.Rotate(
+                lambda t: 360 * t,
+                center=(30, 30),
+                translate=(5, 7),
+                canvas_size=(200, 150),
+            )
+        ]
+    )
+
+    for t in (0, 0.1, 0.23, 0.5, 0.9):
+        frame = clip.get_frame(t)
+        mask = clip.mask.get_frame(t)
+        assert frame.shape == (150, 200, 3)
+        assert mask.shape == (150, 200)
+
+    # reading the mask first or seeking back and forth must not change frames
+    clip.mask.get_frame(0.23)
+    first = clip.get_frame(0.23)
+    clip.get_frame(0.7)
+    clip.mask.get_frame(0.7)
+    second = clip.get_frame(0.23)
+    assert np.array_equal(first, second)
+
+
+def test_rotate_canvas_positioning():
+    """Marker rotates around the given center, then translates, on the canvas."""
+    # 90 degrees around (30, 30), then translate (5, 7)
+    clip = _marker_clip().with_effects(
+        [
+            vfx.Rotate(
+                90,
+                resample="nearest",
+                center=(30, 30),
+                translate=(5, 7),
+                canvas_size=(200, 150),
+            )
+        ]
+    )
+    frame = clip.get_frame(0)
+    # x' = y + cx - cy + dx = 21 + 5 = 26 ; y' = -x + cx + cy + dy = -11 + 60 + 7 = 56
+    assert (frame[56, 26] == (255, 0, 0)).all()
+    # the original marker location is now empty
+    assert (frame[21, 11] == (0, 0, 0)).all()
+
+    # arbitrary angle, same coordinate basis
+    clip = _marker_clip().with_effects(
+        [
+            vfx.Rotate(
+                45,
+                resample="nearest",
+                center=(30, 30),
+                canvas_size=(200, 150),
+            )
+        ]
+    )
+    frame = clip.get_frame(0)
+    # x' = cos45*11 + sin45*21 + (1-cos45)*30 - sin45*30 ~= 10.2
+    # y' = -sin45*11 + cos45*21 + sin45*30 + (1-cos45)*30 ~= 37.1
+    pixel = frame[37, 10]
+    assert pixel[0] > 200 and pixel[1] < 80 and pixel[2] < 80
+
+
+def test_rotate_canvas_zero_angle_with_center_does_not_move():
+    """At 0 degree, setting a rotation center must not shift the image."""
+    clip = _marker_clip().with_effects(
+        [vfx.Rotate(0, center=(30, 30), canvas_size=(200, 150))]
+    )
+    frame = clip.get_frame(0)
+    assert (frame[21, 11] == (255, 0, 0)).all()
+    # the image sits in the top-left corner of the canvas
+    assert (frame[21 + 30, 11] == (0, 0, 0)).all()
+
+
+def test_rotate_canvas_supports_units_and_resamplers():
+    """Radians, angle functions and all resamplers work with a fixed canvas."""
+    for resample in ("nearest", "bilinear", "bicubic"):
+        clip = _marker_clip().with_effects(
+            [
+                vfx.Rotate(
+                    lambda t: math.radians(90),
+                    unit="rad",
+                    resample=resample,
+                    canvas_size=(120, 80),
+                )
+            ]
+        )
+        assert clip.get_frame(0.5).shape == (80, 120, 3)
+
+
+def test_rotate_canvas_transparency():
+    """Empty canvas areas stay transparent, even with ``bg_color`` set."""
+    # a clip without mask gets correct transparent borders
+    clip = _marker_clip().with_effects(
+        [vfx.Rotate(30, canvas_size=(200, 150), bg_color=(0, 0, 255))]
+    )
+    assert clip.mask is not None
+    mask_frame = clip.mask.get_frame(0)
+    assert mask_frame.shape == (150, 200)
+    # corners of the canvas are outside the rotated image: fully transparent
+    assert mask_frame[0, 0] == 0
+    assert mask_frame[-1, -1] == 0
+    # bg_color fills the RGB channels but never the mask
+    rgb_frame = clip.get_frame(0)
+    assert (rgb_frame[0, 0] == (0, 0, 255)).all()
+    # center of the image stays opaque
+    assert mask_frame[30, 50] == 1
+
+    # the source clip and its mask are left untouched
+    source = _marker_clip()
+    rotated = source.with_effects([vfx.Rotate(30, canvas_size=(200, 150))])
+    rotated.get_frame(0)
+    assert source.mask is None
+    assert source.get_frame(0).shape == (60, 100, 3)
+
+
+def test_rotate_canvas_overrides_expand():
+    clip = _marker_clip().with_effects(
+        [vfx.Rotate(30, expand=True, canvas_size=(200, 150))]
+    )
+    assert clip.get_frame(0).shape == (150, 200, 3)
+
+
+def test_rotate_canvas_keeps_duration_and_audio():
+    audio = AudioClip(lambda t: np.zeros((2,)), duration=1, fps=44100)
+    clip = _marker_clip().with_audio(audio)
+    rotated = clip.with_effects([vfx.Rotate(45, canvas_size=(200, 150))])
+    assert rotated.duration == 1
+    assert rotated.audio is not None
+    assert rotated.audio.duration == audio.duration
+    assert np.array_equal(rotated.audio.get_frame(0.5), audio.get_frame(0.5))
+
+
+@pytest.mark.parametrize(
+    "canvas_size",
+    ((0, 100), (100, 0), (-10, 100), (100.5, 100), ("a", 100), (100,), "200x150"),
+)
+def test_rotate_canvas_invalid_size(canvas_size):
+    clip = _marker_clip()
+    with pytest.raises(ValueError, match="canvas_size"):
+        clip.with_effects([vfx.Rotate(30, canvas_size=canvas_size)])
+
+
+@pytest.mark.parametrize("angle", (float("nan"), float("inf"), -float("inf")))
+def test_rotate_non_finite_angle(angle):
+    clip = _marker_clip()
+    with pytest.raises(ValueError, match="finite"):
+        clip.with_effects([vfx.Rotate(angle, canvas_size=(200, 150))])
+
+
 @pytest.mark.parametrize(
     ("unsupported_kwargs",),
     (

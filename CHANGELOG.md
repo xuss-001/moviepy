@@ -20,6 +20,7 @@ This mean you need to specifically set `bg_color=None` if you want to generate a
 
 ### Added
 - Possibility to select audio track when reading a file (#2429)
+- `canvas_size` parameter for `vfx.Rotate` and `VideoClip.rotated`, giving rotation animations a fixed output size with transparent borders
 
 ### Changed 
 - Rewrite FFmpegInfosParser to use indentation and block extractions instead of a state machine (PR #2470)

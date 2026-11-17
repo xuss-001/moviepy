@@ -46,8 +46,27 @@ class Rotate(Effect):
     Optional center of rotation (a 2-tuple). Origin is the upper left corner.
 
     bg_color : tuple, optional
-    An optional color for area outside the rotated image. Only has effect if
-    ``expand`` is true.
+        An optional color for area outside the rotated image. Only has effect if
+        ``expand`` is true.
+
+    canvas_size : tuple, optional
+        An optional fixed output size ``(width, height)`` in pixels. When
+        provided, every frame of the resulting clip has exactly this size,
+        whatever the rotation angle is, which avoids jitter when compositing
+        rotating clips into fixed-size videos.
+
+        In this mode the top-left corner of the original image matches the
+        top-left corner of the canvas before rotation, ``center`` is expressed
+        relatively to the original image's top-left corner (defaulting to the
+        image center), the image is rotated around ``center`` and then shifted
+        by ``translate``. Anything falling outside of the canvas is cropped.
+
+        ``canvas_size`` takes precedence over ``expand`` (which is ignored).
+        Empty areas of the canvas stay transparent: if the clip has no mask, a
+        mask is added so that the transparent borders are preserved, and
+        ``bg_color`` only fills the RGB channels, never the mask.
+
+        Both dimensions must be positive integers.
     """
 
     angle: float
@@ -57,6 +76,29 @@ class Rotate(Effect):
     center: tuple = None
     translate: tuple = None
     bg_color: tuple = None
+    canvas_size: tuple = None
+
+    @staticmethod
+    def _validate_canvas_size(canvas_size) -> tuple:
+        """Validate and normalize a ``(width, height)`` canvas size."""
+        error = ValueError(
+            "'canvas_size' must be a (width, height) tuple of two positive"
+            f" integers, got {canvas_size!r}"
+        )
+        try:
+            width, height = canvas_size
+        except (TypeError, ValueError):
+            raise error from None
+        if (
+            isinstance(width, bool)
+            or isinstance(height, bool)
+            or not isinstance(width, (int, np.integer))
+            or not isinstance(height, (int, np.integer))
+            or width <= 0
+            or height <= 0
+        ):
+            raise error
+        return (int(width), int(height))
 
     def rotate_frame(
         self,
@@ -67,6 +109,7 @@ class Rotate(Effect):
         center: Union[tuple, None],
         translate: Union[tuple, None],
         bg_color: Union[tuple, None],
+        canvas_size: Union[tuple, None] = None,
     ) -> np.ndarray:
         """
         Rotate a single image or mask using OpenCV.
@@ -100,12 +143,50 @@ class Rotate(Effect):
             If `frame` is HxWx3 RGB, bg_color=(R,G,B).
             If HxW mask, bg_color is a scalar. Default black.
 
+        canvas_size : tuple or None
+            Optional fixed ``(width, height)`` of the output canvas. When set,
+            the frame is rotated around `center` (expressed in the original
+            image coordinates, whose top-left corner matches the canvas
+            top-left corner), then shifted by `translate`, and cropped to
+            exactly this size. Takes precedence over `expand`. For masks
+            (HxW frames) the fill value is always 0 so empty areas stay
+            transparent.
+
         Returns
         -------
         rotated : np.ndarray
             The rotated (and possibly expanded) frame or mask.
         """
         h, w = frame.shape[:2]
+
+        if canvas_size is not None:
+            out_w, out_h = canvas_size
+
+            # Empty areas of a mask must stay transparent, so never fill
+            # them with bg_color.
+            if len(frame.shape) == 2:
+                fill_value = 0
+            elif bg_color is not None:
+                fill_value = bg_color
+            else:
+                fill_value = (0, 0, 0)
+
+            cx, cy = center if center is not None else (w / 2, h / 2)
+
+            # Rotate around `center`, then translate, in a single pass.
+            rotation_matrix = cv2.getRotationMatrix2D((cx, cy), angle, 1)
+            if translate is not None:
+                rotation_matrix[0, 2] += translate[0]
+                rotation_matrix[1, 2] += translate[1]
+
+            return cv2.warpAffine(
+                frame,
+                rotation_matrix,
+                (out_w, out_h),
+                flags=resample,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=fill_value,
+            )
 
         if bg_color is None:
             bg_color = (0, 0, 0) if len(frame.shape) == 3 else 0
@@ -177,6 +258,14 @@ class Rotate(Effect):
         else:
             get_angle = lambda t: self.angle
 
+        canvas_size = None
+        if self.canvas_size is not None:
+            canvas_size = self._validate_canvas_size(self.canvas_size)
+            # Empty canvas areas must stay transparent: make sure the clip
+            # has a mask so the borders are not rendered opaque.
+            if not clip.is_mask and clip.mask is None:
+                clip = clip.with_mask()
+
         def filter(get_frame, t):
             angle = get_angle(t)
             im = get_frame(t)
@@ -184,8 +273,18 @@ class Rotate(Effect):
             if self.unit == "rad":
                 angle = math.degrees(angle)
 
+            if not math.isfinite(angle):
+                raise ValueError(
+                    f"'angle' must be a finite number, got {angle!r}"
+                )
+
             angle %= 360
-            if not self.center and not self.translate and not self.bg_color:
+            if (
+                canvas_size is None
+                and not self.center
+                and not self.translate
+                and not self.bg_color
+            ):
                 if (angle == 0) and self.expand:
                     return im
                 if (angle == 90) and self.expand:
@@ -205,6 +304,7 @@ class Rotate(Effect):
                 self.center,
                 self.translate,
                 self.bg_color,
+                canvas_size,
             )
 
         return clip.transform(filter, apply_to=["mask"])
