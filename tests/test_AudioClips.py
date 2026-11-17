@@ -12,6 +12,7 @@ from moviepy.audio.AudioClip import (
     CompositeAudioClip,
     concatenate_audioclips,
 )
+from moviepy.audio.io import ffmpeg_audiowriter
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 
 
@@ -28,6 +29,41 @@ def test_audioclip(util, mono_wave):
     # assert clip.duration == 2
     # assert clip.fps == 22050
     # assert clip.reader.bitrate == 16
+
+
+def test_write_audiofile_failure_closes_log_and_allows_retry(
+    tmp_path, mono_wave, monkeypatch
+):
+    real_open = open
+    opened_logs = []
+
+    def tracking_open(*args, **kwargs):
+        logfile = real_open(*args, **kwargs)
+        opened_logs.append(logfile)
+        return logfile
+
+    monkeypatch.setattr(ffmpeg_audiowriter, "open", tracking_open, raising=False)
+
+    clip = AudioClip(mono_wave(440), duration=1, fps=44100)
+    failed_filename = str(tmp_path / "failed.mp3")
+    log_filename = failed_filename + ".log"
+
+    with pytest.raises(IOError) as error:
+        clip.write_audiofile(
+            failed_filename,
+            codec="nonexistent-codec",
+            write_logfile=True,
+            logger=None,
+        )
+
+    assert "FFMPEG encountered the following error" in str(error.value)
+    assert os.path.getsize(log_filename) > 0
+    assert opened_logs
+    assert all(logfile.closed for logfile in opened_logs)
+
+    successful_filename = str(tmp_path / "successful.wav")
+    clip.write_audiofile(successful_filename, logger=None)
+    assert os.path.getsize(successful_filename) > 0
 
 
 def test_audioclip_io(util):

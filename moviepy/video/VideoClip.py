@@ -42,6 +42,15 @@ from moviepy.video.io.ffmpeg_writer import ffmpeg_write_video
 from moviepy.video.io.gif_writers import write_gif_with_imageio
 
 
+def _file_signature(filename):
+    """Return a cheap signature used to detect changes to a temporary file."""
+    try:
+        stat = os.stat(filename)
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
 class VideoClip(Clip):
     """Base class for video clips.
 
@@ -372,44 +381,56 @@ class VideoClip(Clip):
                 name + Clip._TEMP_FILES_PREFIX + "wvf_snd.%s" % audio_ext,
             )
 
+        temp_audiofile_signature = _file_signature(audiofile) if make_audio else None
+        temp_audiofile_generated = False
+
         # enough cpu for multiprocessing ? USELESS RIGHT NOW, WILL COME AGAIN
         # enough_cpu = (multiprocessing.cpu_count() > 1)
         logger(message="MoviePy - Building video %s." % filename)
-        if make_audio:
-            self.audio.write_audiofile(
-                audiofile,
-                audio_fps,
-                audio_nbytes,
-                audio_bufsize,
-                audio_codec,
-                bitrate=audio_bitrate,
+        try:
+            if make_audio:
+                self.audio.write_audiofile(
+                    audiofile,
+                    audio_fps,
+                    audio_nbytes,
+                    audio_bufsize,
+                    audio_codec,
+                    bitrate=audio_bitrate,
+                    write_logfile=write_logfile,
+                    logger=logger,
+                )
+                temp_audiofile_generated = True
+                # The audio is already encoded,
+                # so there is no need to encode it during video export
+                audio_codec = "copy"
+
+            ffmpeg_write_video(
+                self,
+                filename,
+                fps,
+                codec,
+                bitrate=bitrate,
+                preset=preset,
                 write_logfile=write_logfile,
+                audiofile=audiofile,
+                audio_codec=audio_codec,
+                threads=threads,
+                ffmpeg_params=ffmpeg_params,
                 logger=logger,
+                pixel_format=pixel_format,
             )
-            # The audio is already encoded,
-            # so there is no need to encode it during video export
-            audio_codec = "copy"
 
-        ffmpeg_write_video(
-            self,
-            filename,
-            fps,
-            codec,
-            bitrate=bitrate,
-            preset=preset,
-            write_logfile=write_logfile,
-            audiofile=audiofile,
-            audio_codec=audio_codec,
-            threads=threads,
-            ffmpeg_params=ffmpeg_params,
-            logger=logger,
-            pixel_format=pixel_format,
-        )
-
-        if remove_temp and make_audio:
-            if os.path.exists(audiofile):
-                os.remove(audiofile)
-        logger(message="MoviePy - video ready %s" % filename)
+            logger(message="MoviePy - video ready %s" % filename)
+        finally:
+            if remove_temp and make_audio:
+                try:
+                    temp_audiofile_changed = (
+                        _file_signature(audiofile) != temp_audiofile_signature
+                    )
+                    if temp_audiofile_generated or temp_audiofile_changed:
+                        os.remove(audiofile)
+                except Exception:
+                    pass
 
     @requires_duration
     @use_clip_fps_by_default

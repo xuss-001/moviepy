@@ -101,6 +101,7 @@ class FFMPEG_VideoWriter:
     ):
         if logfile is None:
             logfile = sp.PIPE
+        self._owns_stderr = logfile == sp.PIPE
         self.logfile = logfile
         self.filename = filename
         self.codec = codec
@@ -188,14 +189,23 @@ class FFMPEG_VideoWriter:
 
             self.proc.stdin.write(img_array)
         except IOError as err:
-            _, ffmpeg_error = self.proc.communicate()
+            try:
+                _, ffmpeg_error = self.proc.communicate()
+            except Exception:
+                ffmpeg_error = None
             if ffmpeg_error is not None:
-                ffmpeg_error = ffmpeg_error.decode()
+                if isinstance(ffmpeg_error, bytes):
+                    ffmpeg_error = ffmpeg_error.decode()
             else:
                 # The error was redirected to a logfile with `write_logfile=True`,
                 # so read the error from that file instead
-                self.logfile.seek(0)
-                ffmpeg_error = self.logfile.read()
+                try:
+                    self.logfile.seek(0)
+                    ffmpeg_error = self.logfile.read()
+                    if isinstance(ffmpeg_error, bytes):
+                        ffmpeg_error = ffmpeg_error.decode()
+                except Exception:
+                    ffmpeg_error = ""
 
             error = (
                 f"{err}\n\nMoviePy error: FFMPEG encountered the following error while "
@@ -240,23 +250,65 @@ class FFMPEG_VideoWriter:
 
             raise IOError(error)
 
-    def close(self):
-        """Closes the writer, terminating the subprocess if is still alive."""
-        if self.proc:
-            self.proc.stdin.close()
-            if self.proc.stderr is not None:
-                self.proc.stderr.close()
-            self.proc.wait()
+    def close(self, terminate=False):
+        """Close pipes and wait for the subprocess, terminating it if needed."""
+        proc = getattr(self, "proc", None)
+        if proc is None:
+            return
+        self.proc = None
 
-            self.proc = None
+        stdin = getattr(proc, "stdin", None)
+        if stdin is not None:
+            try:
+                stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.stdin = None
+            except Exception:
+                pass
+
+        if getattr(self, "_owns_stderr", False):
+            stderr = getattr(proc, "stderr", None)
+            if stderr is not None:
+                try:
+                    stderr.close()
+                except Exception:
+                    pass
+                try:
+                    proc.stderr = None
+                except Exception:
+                    pass
+
+        if terminate:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+
+        try:
+            proc.wait()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait()
+            except Exception:
+                pass
 
     # Support the Context Manager protocol, to ensure that resources are cleaned up.
+
+    def __del__(self):
+        self.close(terminate=True)
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
+        self.close(terminate=exc_type is not None)
 
 
 def ffmpeg_write_video(
@@ -279,44 +331,48 @@ def ffmpeg_write_video(
     """
     logger = proglog.default_bar_logger(logger)
 
-    if write_logfile:
-        logfile = open(filename + ".log", "w+")
-    else:
-        logfile = None
+    logfile = None
+    try:
+        if write_logfile:
+            logfile = open(filename + ".log", "w+")
 
-    logger(message="MoviePy - Writing video %s\n" % filename)
+        logger(message="MoviePy - Writing video %s\n" % filename)
 
-    has_mask = clip.mask is not None
+        has_mask = clip.mask is not None
 
-    with FFMPEG_VideoWriter(
-        filename,
-        clip.size,
-        fps,
-        codec=codec,
-        preset=preset,
-        bitrate=bitrate,
-        with_mask=has_mask,
-        logfile=logfile,
-        audiofile=audiofile,
-        audio_codec=audio_codec,
-        threads=threads,
-        ffmpeg_params=ffmpeg_params,
-        pixel_format=pixel_format,
-    ) as writer:
-        for t, frame in clip.iter_frames(
-            logger=logger, with_times=True, fps=fps, dtype="uint8"
-        ):
-            if clip.mask is not None:
-                mask = 255 * clip.mask.get_frame(t)
-                if mask.dtype != "uint8":
-                    mask = mask.astype("uint8")
-                frame = np.dstack([frame, mask])
+        with FFMPEG_VideoWriter(
+            filename,
+            clip.size,
+            fps,
+            codec=codec,
+            preset=preset,
+            bitrate=bitrate,
+            with_mask=has_mask,
+            logfile=logfile,
+            audiofile=audiofile,
+            audio_codec=audio_codec,
+            threads=threads,
+            ffmpeg_params=ffmpeg_params,
+            pixel_format=pixel_format,
+        ) as writer:
+            for t, frame in clip.iter_frames(
+                logger=logger, with_times=True, fps=fps, dtype="uint8"
+            ):
+                if clip.mask is not None:
+                    mask = 255 * clip.mask.get_frame(t)
+                    if mask.dtype != "uint8":
+                        mask = mask.astype("uint8")
+                    frame = np.dstack([frame, mask])
 
-            writer.write_frame(frame)
+                writer.write_frame(frame)
 
-    if write_logfile:
-        logfile.close()
-    logger(message="MoviePy - Done !")
+        logger(message="MoviePy - Done !")
+    finally:
+        if logfile is not None:
+            try:
+                logfile.close()
+            except Exception:
+                pass
 
 
 def ffmpeg_write_image(filename, image, logfile=False, pixel_format=None):

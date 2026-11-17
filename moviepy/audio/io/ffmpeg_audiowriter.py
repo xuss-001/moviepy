@@ -64,6 +64,7 @@ class FFMPEG_AudioWriter:
     ):
         if logfile is None:
             logfile = sp.PIPE
+        self._owns_stderr = logfile == sp.PIPE
         self.logfile = logfile
         self.filename = filename
         self.codec = codec
@@ -110,14 +111,23 @@ class FFMPEG_AudioWriter:
         try:
             self.proc.stdin.write(frames_array.tobytes())
         except IOError as err:
-            _, ffmpeg_error = self.proc.communicate()
+            try:
+                _, ffmpeg_error = self.proc.communicate()
+            except Exception:
+                ffmpeg_error = None
             if ffmpeg_error is not None:
-                ffmpeg_error = ffmpeg_error.decode()
+                if isinstance(ffmpeg_error, bytes):
+                    ffmpeg_error = ffmpeg_error.decode()
             else:
                 # The error was redirected to a logfile with `write_logfile=True`,
                 # so read the error from that file instead
-                self.logfile.seek(0)
-                ffmpeg_error = self.logfile.read()
+                try:
+                    self.logfile.seek(0)
+                    ffmpeg_error = self.logfile.read()
+                    if isinstance(ffmpeg_error, bytes):
+                        ffmpeg_error = ffmpeg_error.decode()
+                except Exception:
+                    ffmpeg_error = ""
 
             error = (
                 f"{err}\n\nMoviePy error: FFMPEG encountered the following error while "
@@ -158,21 +168,58 @@ class FFMPEG_AudioWriter:
 
             raise IOError(error)
 
-    def close(self):
-        """Closes the writer, terminating the subprocess if is still alive."""
-        if hasattr(self, "proc") and self.proc:
-            self.proc.stdin.close()
-            self.proc.stdin = None
-            if self.proc.stderr is not None:
-                self.proc.stderr.close()
-                self.proc.stderr = None
-            # If this causes deadlocks, consider terminating instead.
-            self.proc.wait()
-            self.proc = None
+    def close(self, terminate=False):
+        """Close pipes and wait for the subprocess, terminating it if needed."""
+        proc = getattr(self, "proc", None)
+        if proc is None:
+            return
+        self.proc = None
+
+        stdin = getattr(proc, "stdin", None)
+        if stdin is not None:
+            try:
+                stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.stdin = None
+            except Exception:
+                pass
+
+        if getattr(self, "_owns_stderr", False):
+            stderr = getattr(proc, "stderr", None)
+            if stderr is not None:
+                try:
+                    stderr.close()
+                except Exception:
+                    pass
+                try:
+                    proc.stderr = None
+                except Exception:
+                    pass
+
+        if terminate:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+
+        try:
+            proc.wait()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait()
+            except Exception:
+                pass
 
     def __del__(self):
         # If the garbage collector comes, make sure the subprocess is terminated.
-        self.close()
+        self.close(terminate=True)
 
     # Support the Context Manager protocol, to ensure that resources are cleaned up.
 
@@ -180,7 +227,7 @@ class FFMPEG_AudioWriter:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
+        self.close(terminate=exc_type is not None)
 
 
 @requires_duration
@@ -204,26 +251,32 @@ def ffmpeg_audiowrite(
         logfile = open(filename + ".log", "w+")
     else:
         logfile = None
-    logger = proglog.default_bar_logger(logger)
-    logger(message="MoviePy - Writing audio in %s" % filename)
-    writer = FFMPEG_AudioWriter(
-        filename,
-        fps,
-        nbytes,
-        clip.nchannels,
-        codec=codec,
-        bitrate=bitrate,
-        logfile=logfile,
-        ffmpeg_params=ffmpeg_params,
-    )
+    try:
+        logger = proglog.default_bar_logger(logger)
+        logger(message="MoviePy - Writing audio in %s" % filename)
+        with FFMPEG_AudioWriter(
+            filename,
+            fps,
+            nbytes,
+            clip.nchannels,
+            codec=codec,
+            bitrate=bitrate,
+            logfile=logfile,
+            ffmpeg_params=ffmpeg_params,
+        ) as writer:
+            for chunk in clip.iter_chunks(
+                chunksize=buffersize,
+                quantize=True,
+                nbytes=nbytes,
+                fps=fps,
+                logger=logger,
+            ):
+                writer.write_frames(chunk)
 
-    for chunk in clip.iter_chunks(
-        chunksize=buffersize, quantize=True, nbytes=nbytes, fps=fps, logger=logger
-    ):
-        writer.write_frames(chunk)
-
-    writer.close()
-
-    if write_logfile:
-        logfile.close()
-    logger(message="MoviePy - Done.")
+        logger(message="MoviePy - Done.")
+    finally:
+        if logfile is not None:
+            try:
+                logfile.close()
+            except Exception:
+                pass

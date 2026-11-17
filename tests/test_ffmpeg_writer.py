@@ -8,10 +8,82 @@ from PIL import Image
 import pytest
 
 from moviepy import *
+from moviepy.audio.io.ffmpeg_audiowriter import FFMPEG_AudioWriter
 from moviepy.video.compositing.CompositeVideoClip import concatenate_videoclips
-from moviepy.video.io.ffmpeg_writer import ffmpeg_write_image, ffmpeg_write_video
+from moviepy.video.io.ffmpeg_writer import (
+    FFMPEG_VideoWriter,
+    ffmpeg_write_image,
+    ffmpeg_write_video,
+)
 from moviepy.video.io.gif_writers import write_gif_with_imageio
 from moviepy.video.tools.drawing import color_gradient
+
+
+class _FailingStream:
+    def __init__(self):
+        self.close_calls = 0
+
+    def close(self):
+        self.close_calls += 1
+        raise RuntimeError("stream close failed")
+
+
+class _FakeProcess:
+    def __init__(self):
+        self.stdin = _FailingStream()
+        self.stderr = _FailingStream()
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.wait_calls = 0
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        self.terminate_calls += 1
+
+    def kill(self):
+        self.kill_calls += 1
+
+    def wait(self):
+        self.wait_calls += 1
+        if self.wait_calls == 1:
+            raise RuntimeError("process wait failed")
+
+
+@pytest.mark.parametrize("writer_class", (FFMPEG_AudioWriter, FFMPEG_VideoWriter))
+def test_ffmpeg_writer_close_is_best_effort_and_idempotent(writer_class):
+    writer = writer_class.__new__(writer_class)
+    writer._owns_stderr = True
+    proc = writer.proc = _FakeProcess()
+    stdin = proc.stdin
+    stderr = proc.stderr
+
+    writer.close(terminate=True)
+
+    assert writer.proc is None
+    assert stdin.close_calls == 1
+    assert stderr.close_calls == 1
+    assert proc.terminate_calls == 1
+    assert proc.kill_calls == 1
+    assert proc.wait_calls == 2
+    assert writer._owns_stderr
+    assert writer.proc is None
+    writer.close(terminate=True)
+
+
+def test_ffmpeg_writer_does_not_close_external_logfile(tmp_path):
+    external_logfile = open(tmp_path / "external.log", "w+")
+    writer = FFMPEG_VideoWriter.__new__(FFMPEG_VideoWriter)
+    writer._owns_stderr = False
+    writer.proc = _FakeProcess()
+    writer.proc.stderr = external_logfile
+
+    try:
+        writer.close(terminate=True)
+        assert not external_logfile.closed
+    finally:
+        external_logfile.close()
 
 
 @pytest.mark.parametrize(
