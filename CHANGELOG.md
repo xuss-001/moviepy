@@ -17,9 +17,11 @@ This mean you need to specifically set `bg_color=None` if you want to generate a
 - Fix TextClip broken with Pillow > 11.2
 - `pixel_format` parameter was ignored when calling ffmpeg writer, as referenced in PR #2359
 - Fix incorrect handling of lines with a format different from "key: value" during FFmpeg infos parsing (see #2311, #1860, #2418, #2470)
+- Make `SubtitlesClip` consistently select the first active subtitle in input order
 
 ### Added
 - Possibility to select audio track when reading a file (#2429)
+- Add an optional stacked mode for overlapping subtitles in `SubtitlesClip`
 
 ### Changed 
 - Rewrite FFmpegInfosParser to use indentation and block extractions instead of a state machine (PR #2470)
