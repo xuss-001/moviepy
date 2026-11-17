@@ -106,6 +106,10 @@ When creating an image sequence, ``sequence`` can be either a list of image name
 .. warning::
     All the images in the list/folder/frames must be of the same size, or an exception will be raised.
 
+The sequence may mix RGB and RGBA pictures of identical size. With ``with_mask=True`` (the default), RGB pictures are treated as fully opaque while RGBA pictures keep their alpha channel, and the clip gets a mask whose frame always comes from the same picture as the RGB frame, including when seeking backwards. Set ``with_mask=False`` to ignore the alpha channel entirely.
+
+Each picture can have its own duration through the ``durations`` argument: a picture is visible from its own start time up to the start time of the next picture, so a picture is never displayed early. Pictures with a duration of ``0`` are skipped and the total duration must stay strictly positive. When both ``fps`` and ``durations`` are given, ``fps`` takes precedence. By default the pictures are read lazily from disk and only the last decoded picture is cached; pass ``load_images=True`` to load the whole sequence into RAM instead.
+
 For more, see :py:class:`~moviepy.video.io.ImageSequenceClip.ImageSequenceClip`.
 
 DataVideoClip
