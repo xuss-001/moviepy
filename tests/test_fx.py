@@ -809,6 +809,199 @@ def test_resize(apply_to_mask, size, duration, new_size, height, width):
             assert len(mask_frame) == expected_height
 
 
+def _alpha_icon_rgba():
+    """Build an icon with semi-transparent edges and vivid hidden pixels."""
+    coordinates = np.arange(6)
+    y, x = np.meshgrid(coordinates, coordinates, indexing="ij")
+    distance = np.sqrt((x - 2.5) ** 2 + (y - 2.5) ** 2)
+    alpha = np.clip((3.5 - distance) / 1.5, 0, 1)
+
+    rgba = np.zeros((6, 6, 4), dtype=np.uint8)
+    rgba[..., 0] = 255
+    rgba[..., 3] = np.rint(alpha * 255).astype(np.uint8)
+    rgba[alpha == 0, :3] = (0, 255, 0)
+    return rgba
+
+
+def test_resize_transparent_edge_protection_removes_hidden_color():
+    rgba = np.array([[[255, 0, 0, 255], [0, 255, 0, 0]]], dtype=np.uint8)
+    clip = ImageClip(rgba, duration=1)
+    source_frame = clip.get_frame(0).copy()
+    source_mask = clip.mask.get_frame(0).copy()
+
+    resized = clip.with_effects([vfx.Resize((1, 1), transparent_edge_protection=True)])
+
+    assert np.array_equal(resized.get_frame(0), np.array([[[255, 0, 0]]]))
+    np.testing.assert_allclose(resized.mask.get_frame(0), [[0.5]])
+    assert np.array_equal(clip.get_frame(0), source_frame)
+    assert np.array_equal(clip.mask.get_frame(0), source_mask)
+
+
+def test_resize_transparent_edge_protection_preserves_semi_transparent_colors():
+    rgba = np.array([[[255, 0, 0, 255], [0, 0, 255, 128]]], dtype=np.uint8)
+    clip = ImageClip(rgba, duration=1)
+
+    resized = clip.with_effects([vfx.Resize((1, 1), transparent_edge_protection=True)])
+
+    alpha_one = 128 / 255
+    alpha = (1 + alpha_one) / 2
+    expected_color = np.array([255, 0, 255 * alpha_one]) / (1 + alpha_one)
+    np.testing.assert_allclose(resized.get_frame(0)[0, 0], expected_color, atol=1)
+    np.testing.assert_allclose(resized.mask.get_frame(0), [[alpha]], atol=1 / 255)
+
+
+def test_resize_transparent_edge_protection_fully_transparent_is_valid():
+    rgba = np.zeros((3, 3, 4), dtype=np.uint8)
+    rgba[..., :3] = (0, 255, 255)
+    clip = ImageClip(rgba, duration=1)
+
+    for size in ((1, 1), (6, 6)):
+        resized = clip.with_effects(
+            [vfx.Resize(size, transparent_edge_protection=True)]
+        )
+        frame = resized.get_frame(0)
+        mask = resized.mask.get_frame(0)
+
+        assert np.isfinite(frame).all()
+        assert np.isfinite(mask).all()
+        assert np.array_equal(frame, np.zeros_like(frame))
+        assert np.array_equal(mask, np.zeros_like(mask))
+
+
+@pytest.mark.parametrize(
+    ("resize_kwargs", "expected_sizes"),
+    (
+        ({"new_size": (3, 3)}, ((3, 3), (3, 3))),
+        ({"new_size": (12, 12)}, ((12, 12), (12, 12))),
+        ({"new_size": 0.5}, ((3, 3), (3, 3))),
+        ({"width": 3}, ((3, 3), (3, 3))),
+        ({"height": 2}, ((2, 2), (2, 2))),
+        (
+            {"new_size": lambda t: ((3, 3), (6, 6))[int(t)]},
+            ((3, 3), (6, 6)),
+        ),
+        ({"width": lambda t: (3, 6)[int(t)]}, ((3, 3), (6, 6))),
+        ({"height": lambda t: (2, 4)[int(t)]}, ((2, 2), (4, 4))),
+    ),
+)
+def test_resize_transparent_edge_protection_size_arguments(
+    resize_kwargs, expected_sizes
+):
+    clip = ImageClip(_alpha_icon_rgba(), duration=2)
+    resized = clip.with_effects(
+        [vfx.Resize(transparent_edge_protection=True, **resize_kwargs)]
+    )
+
+    for t, expected_size in enumerate(expected_sizes):
+        frame = resized.get_frame(t)
+        mask = resized.mask.get_frame(t)
+        expected_height, expected_width = expected_size[1], expected_size[0]
+
+        assert frame.shape == (expected_height, expected_width, 3)
+        assert mask.shape == (expected_height, expected_width)
+        assert np.isfinite(frame).all()
+        assert np.isfinite(mask).all()
+        assert frame[..., 1].max() == 0
+        assert mask.min() >= 0 and mask.max() <= 1
+
+
+def test_resize_transparent_edge_protection_frame_order_and_round_trip():
+    clip = ImageClip(_alpha_icon_rgba(), duration=2)
+    effect = vfx.Resize(
+        lambda t: ((3, 3), (6, 6))[int(t)],
+        transparent_edge_protection=True,
+    )
+
+    mask_first = clip.with_effects([effect])
+    mask_0 = mask_first.mask.get_frame(0).copy()
+    frame_0 = mask_first.get_frame(0).copy()
+    frame_1 = mask_first.get_frame(1).copy()
+    mask_1 = mask_first.mask.get_frame(1).copy()
+    frame_0_again = mask_first.get_frame(0).copy()
+    mask_0_again = mask_first.mask.get_frame(0).copy()
+
+    frame_first = clip.with_effects([effect])
+    frame_from_frame_first = frame_first.get_frame(0).copy()
+    mask_from_frame_first = frame_first.mask.get_frame(0).copy()
+
+    assert frame_0.shape == (3, 3, 3)
+    assert frame_1.shape == (6, 6, 3)
+    assert np.array_equal(frame_0, frame_0_again)
+    assert np.array_equal(mask_0, mask_0_again)
+    assert np.array_equal(frame_0, frame_from_frame_first)
+    assert np.array_equal(mask_0, mask_from_frame_first)
+    assert mask_1.shape == (6, 6)
+
+
+def test_resize_transparent_edge_protection_errors():
+    clip = ColorClip((4, 4), color=(255, 0, 0), duration=1).with_mask(
+        ColorClip((3, 4), color=1, is_mask=True)
+    )
+    with pytest.raises(ValueError, match="dimensions must match"):
+        clip.with_effects([vfx.Resize((2, 2), transparent_edge_protection=True)])
+
+    clip = ColorClip((4, 4), color=(255, 0, 0), duration=1).with_mask(
+        ColorClip((4, 4), color=1, is_mask=True)
+    )
+    with pytest.raises(ValueError, match="apply_to_mask"):
+        clip.with_effects(
+            [
+                vfx.Resize(
+                    (2, 2),
+                    apply_to_mask=False,
+                    transparent_edge_protection=True,
+                )
+            ]
+        )
+
+    image = VideoClip(
+        lambda t: np.zeros((4, 4 if t == 0 else 5, 3), dtype=np.uint8),
+        duration=2,
+    )
+    mask = VideoClip(
+        lambda t: np.ones((4, 4 if t == 0 else 3), dtype=float),
+        is_mask=True,
+        duration=2,
+    )
+    resized = image.with_mask(mask).with_effects(
+        [vfx.Resize((2, 2), transparent_edge_protection=True)]
+    )
+    with pytest.raises(ValueError, match="dimensions must match"):
+        resized.get_frame(1)
+    with pytest.raises(ValueError, match="dimensions must match"):
+        resized.mask.get_frame(1)
+
+
+def test_resize_transparent_edge_protection_without_mask_uses_standard_resize():
+    clip = ImageClip(_alpha_icon_rgba()[..., :3], duration=1)
+    standard = clip.with_effects([vfx.Resize((3, 3))])
+    protected = clip.with_effects(
+        [vfx.Resize((3, 3), transparent_edge_protection=True)]
+    )
+
+    assert np.array_equal(standard.get_frame(0), protected.get_frame(0))
+
+
+def test_resize_transparent_edge_protection_export_on_backgrounds(tmp_path):
+    clip = ImageClip(_alpha_icon_rgba(), duration=1).with_effects(
+        [vfx.Resize((18, 18), transparent_edge_protection=True)]
+    )
+
+    exports = {}
+    for name, color in (("black", (0, 0, 0)), ("white", (255, 255, 255))):
+        background = ColorClip((18, 18), color=color, duration=1)
+        composition = CompositeVideoClip([background, clip])
+        path = tmp_path / f"icon_on_{name}.png"
+        composition.save_frame(path, t=0, with_mask=False)
+        exports[name] = np.asarray(Image.open(path).convert("RGB"))
+
+    assert np.all(exports["black"][..., 1] == 0)
+    assert np.all(exports["black"][..., 2] == 0)
+    np.testing.assert_allclose(
+        exports["white"][..., 1], exports["white"][..., 2], atol=1
+    )
+
+
 @pytest.mark.parametrize("unit", ["deg", "rad"])
 @pytest.mark.parametrize("resample", ["bilinear", "nearest", "bicubic", "unknown"])
 @pytest.mark.parametrize(

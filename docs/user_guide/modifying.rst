@@ -91,6 +91,25 @@ So, you may write something like:
 .. note::
     MoviePy effects are automatically applied to both the sound and the mask of the clip if it is relevant, so that you don't have to worry about modifying these.
 
+Resizing clips with transparency
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Resizing RGB frames and their masks separately can make colors hidden in fully
+transparent pixels bleed into anti-aliased edges. Enable
+``transparent_edge_protection`` to resize both together using premultiplied
+alpha. The visible colors and the alpha coverage of semi-transparent edges are
+both preserved, while fully transparent pixels do not contribute color.
+
+.. literalinclude:: /_static/code/user_guide/effects/resize_transparent.py
+    :language: python
+
+The option works with fixed sizes, scale factors, ``width``, ``height``, and
+time-dependent versions of those arguments. It requires a mask and
+``apply_to_mask=True``; use the default ``False`` for the previous behavior.
+Clips without a mask are resized as ordinary images. The mode is intended for
+ordinary RGB frames and masks with values in the 0 to 1 range; it does not add
+HDR or color-management conversion.
+
 For a list of those effects, see :py:mod:`moviepy.video.fx` and :py:mod:`moviepy.audio.fx`.
 
 In addition to the effects already provided by MoviePy, you can obviously :ref:`create_effects` and use them the same way.

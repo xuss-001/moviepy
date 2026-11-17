@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Union
 
 import cv2
+import numpy as np
 
 from moviepy.Effect import Effect
 
@@ -28,6 +29,16 @@ class Resize(Effect):
         Width of the new clip in pixels. The height is then computed so
         that the width/height ratio is conserved.
 
+    apply_to_mask : bool, optional
+        Resize the clip mask together with the image. Defaults to ``True``.
+
+    transparent_edge_protection : bool, optional
+        Resize the image and its mask together using premultiplied alpha.
+        This prevents colors hidden in fully transparent pixels from bleeding
+        into visible or semi-transparent edges. Requires a mask and
+        ``apply_to_mask=True``. If the clip has no mask, the image is resized
+        normally. Defaults to ``False``, which preserves the previous behavior.
+
     Examples
     --------
 
@@ -37,12 +48,16 @@ class Resize(Effect):
         clip.with_effects([vfx.Resize(0.6)]) # width and height multiplied by 0.6
         clip.with_effects([vfx.Resize(width=800)]) # height computed automatically.
         clip.with_effects([vfx.Resize(lambda t : 1+0.02*t)]) # slow clip swelling
+        clip.with_effects(
+            [vfx.Resize(0.6, transparent_edge_protection=True)]
+        ) # resize alpha without color bleeding
     """
 
     new_size: Union[tuple, float, callable] = None
     height: int = None
     width: int = None
     apply_to_mask: bool = True
+    transparent_edge_protection: bool = False
 
     def resizer(self, pic, new_size):
         """Resize the image using openCV."""
@@ -57,6 +72,159 @@ class Resize(Effect):
 
     def apply(self, clip):
         """Apply the effect to the clip."""
+        if self.transparent_edge_protection:
+            if not self.apply_to_mask:
+                raise ValueError(
+                    "'transparent_edge_protection=True' requires "
+                    "'apply_to_mask=True'"
+                )
+            if clip.mask is not None and not clip.is_mask:
+                return self._apply_with_transparent_edge_protection(clip)
+
+        return self._apply_standard(clip)
+
+    @staticmethod
+    def _interpolation_for(source_shape, new_size):
+        """Return the interpolation used by the regular resizer."""
+        width, height = int(new_size[0]), int(new_size[1])
+        if width > source_shape[1] or height > source_shape[0]:
+            return cv2.INTER_LINEAR
+        return cv2.INTER_AREA
+
+    @staticmethod
+    def _resize_rgb_and_mask(image, mask, new_size):
+        """Resize RGB and alpha together without mixing hidden RGB colors."""
+        if image.shape[:2] != mask.shape[:2]:
+            raise ValueError(
+                "Image and mask dimensions must match for transparent edge "
+                f"protection, got image {image.shape[:2]} and mask "
+                f"{mask.shape[:2]}"
+            )
+
+        width, height = int(new_size[0]), int(new_size[1])
+        image_float = image.astype(np.float32, copy=False)
+        mask_float = np.clip(mask.astype(np.float32, copy=False), 0.0, 1.0)
+        premultiplied = image_float * mask_float[..., None]
+
+        if (height, width) == image.shape[:2]:
+            resized_image = premultiplied
+            resized_mask = mask_float
+        else:
+            interpolation = Resize._interpolation_for(image.shape, new_size)
+            resized_image = cv2.resize(
+                premultiplied, (width, height), interpolation=interpolation
+            )
+            resized_mask = cv2.resize(
+                mask_float, (width, height), interpolation=interpolation
+            )
+
+        resized_mask = np.clip(
+            np.nan_to_num(resized_mask, nan=0.0, posinf=1.0, neginf=0.0),
+            0.0,
+            1.0,
+        )
+        visible = resized_mask > 0
+        safe_mask = np.where(visible, resized_mask, 1.0)
+        resized_image = resized_image / safe_mask[..., None]
+        resized_image = np.where(visible[..., None], resized_image, 0.0)
+        resized_image = np.clip(
+            np.nan_to_num(resized_image, nan=0.0, posinf=255.0, neginf=0.0),
+            0.0,
+            255.0,
+        )
+
+        if np.issubdtype(image.dtype, np.integer):
+            image_info = np.iinfo(image.dtype)
+            resized_image = np.clip(
+                np.rint(resized_image), image_info.min, image_info.max
+            ).astype(image.dtype)
+        else:
+            resized_image = resized_image.astype(image.dtype, copy=False)
+
+        if np.issubdtype(mask.dtype, np.floating):
+            resized_mask = resized_mask.astype(mask.dtype, copy=False)
+        else:
+            resized_mask = resized_mask.astype(float)
+
+        return resized_image, resized_mask
+
+    def _get_size_function(self, clip):
+        """Return a function giving the requested size at a given time."""
+        width, height = clip.size
+
+        def translate_new_size(new_size):
+            if isinstance(new_size, numbers.Number):
+                return [new_size * width, new_size * height]
+            return new_size
+
+        if self.new_size is not None:
+            if callable(self.new_size):
+                return lambda t: translate_new_size(self.new_size(t))
+            return lambda t: translate_new_size(self.new_size)
+
+        if self.height is not None:
+            if callable(self.height):
+
+                def size_from_height(t):
+                    new_height = int(self.height(t))
+                    return [width * new_height / height, new_height]
+
+            else:
+
+                def size_from_height(t):
+                    return [width * self.height / height, self.height]
+
+            return size_from_height
+
+        if self.width is not None:
+            if callable(self.width):
+
+                def size_from_width(t):
+                    new_width = self.width(t)
+                    return [new_width, height * new_width / width]
+
+            else:
+
+                def size_from_width(t):
+                    return [self.width, height * self.width / width]
+
+            return size_from_width
+
+        raise ValueError("You must provide either 'new_size' or 'height' or 'width'")
+
+    def _apply_with_transparent_edge_protection(self, clip):
+        """Resize an RGB clip and its mask as one premultiplied-alpha pair."""
+        mask = clip.mask
+        if tuple(clip.size) != tuple(mask.size):
+            raise ValueError(
+                "Image and mask dimensions must match for transparent edge "
+                f"protection, got image {tuple(clip.size)} and mask "
+                f"{tuple(mask.size)}"
+            )
+
+        get_new_size = self._get_size_function(clip)
+        get_image = clip.get_frame
+        get_mask = mask.get_frame
+
+        def resize_at(t):
+            image, resized_mask = self._resize_rgb_and_mask(
+                get_image(t), get_mask(t), get_new_size(t)
+            )
+            return image, resized_mask
+
+        new_clip = clip.transform(
+            lambda get_frame, t: resize_at(t)[0],
+            keep_duration=True,
+        )
+        new_mask = mask.transform(
+            lambda get_frame, t: resize_at(t)[1],
+            keep_duration=True,
+        )
+        new_clip.mask = new_mask
+        return new_clip
+
+    def _apply_standard(self, clip):
+        """Apply the effect using the historical resize implementation."""
         w, h = clip.size
 
         if self.new_size is not None:

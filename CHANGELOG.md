@@ -20,6 +20,7 @@ This mean you need to specifically set `bg_color=None` if you want to generate a
 
 ### Added
 - Possibility to select audio track when reading a file (#2429)
+- Optional `transparent_edge_protection` mode for `Resize` that resizes RGB and mask together without color bleeding from transparent pixels
 
 ### Changed 
 - Rewrite FFmpegInfosParser to use indentation and block extractions instead of a state machine (PR #2470)
