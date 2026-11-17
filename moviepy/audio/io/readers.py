@@ -1,7 +1,6 @@
 """MoviePy audio reading with ffmpeg."""
 
 import subprocess as sp
-import warnings
 
 import numpy as np
 
@@ -81,21 +80,15 @@ class FFMPEG_AudioReader:
         """Opens the file, creates the pipe."""
         self.close()  # if any
 
+        i_arg = [
+            "-i",
+            ffmpeg_escape_filename(self.filename),
+            "-map",
+            "0:a:%d" % self.audio_stream_index,
+            "-vn",
+        ]
         if start_time != 0:
-            offset = min(1, start_time)
-            i_arg = [
-                "-ss",
-                "%.05f" % (start_time - offset),
-                "-i",
-                ffmpeg_escape_filename(self.filename),
-                "-map",
-                "0:a:%d" % self.audio_stream_index,
-                "-vn",
-                "-ss",
-                "%.05f" % offset,
-            ]
-        else:
-            i_arg = ["-i", ffmpeg_escape_filename(self.filename), "-vn"]
+            i_arg.extend(["-ss", "%.09f" % start_time])
 
         cmd = (
             [FFMPEG_BINARY]
@@ -194,6 +187,16 @@ class FFMPEG_AudioReader:
         # last case standing: pos = current pos
         self.pos = pos
 
+    def _frame_index(self, tt):
+        """Return the sample index used for both scalar and array reads."""
+        return int(np.round(self.fps * tt))
+
+    def _get_frame_from_buffer(self, frame):
+        """Return one frame, loading a finite buffer around it if needed."""
+        if not (0 <= (frame - self.buffer_startframe) < len(self.buffer)):
+            self.buffer_around(frame)
+        return self.buffer[frame - self.buffer_startframe]
+
     def get_frame(self, tt):
         """Retrieve the audio frame(s) corresponding to the given timestamp(s).
 
@@ -205,76 +208,47 @@ class FFMPEG_AudioReader:
           timestamp is returned. If `tt` is a NumPy array of timestamps, an
           array of frames corresponding to each timestamp is returned.
         """
-        if isinstance(tt, np.ndarray):
-            # lazy implementation, but should not cause problems in
-            # 99.99 %  of the cases
+        tt_array = np.asarray(tt)
 
-            # elements of t that are actually in the range of the
-            # audio file.
-            in_time = (tt >= 0) & (tt < self.duration)
-
-            # Check that the requested time is in the valid range
-            if not in_time.any():
-                raise IOError(
-                    "Error in file %s, " % (self.filename)
-                    + "Accessing time t=%.02f-%.02f seconds, " % (tt[0], tt[-1])
-                    + "with clip duration=%f seconds, " % self.duration
-                )
-
-            # The np.round in the next line is super-important.
-            # Removing it results in artifacts in the noise.
-            frames = np.round((self.fps * tt)).astype(int)[in_time]
-            fr_min, fr_max = frames.min(), frames.max()
-
-            # if min and max frames don't fit the buffer, it results in IndexError
-            # we avoid that by recursively calling this function on smaller length
-            # and concatenate the results:w
-            max_frame_threshold = fr_min + self.buffersize // 2
-            threshold_idx = np.searchsorted(frames, max_frame_threshold, side="right")
-            if threshold_idx != len(frames):
-                in_time_head = in_time[0:threshold_idx]
-                in_time_tail = in_time[threshold_idx:]
-                return np.concatenate(
-                    [self.get_frame(in_time_head), self.get_frame(in_time_tail)]
-                )
-
-            if not (0 <= (fr_min - self.buffer_startframe) < len(self.buffer)):
-                self.buffer_around(fr_min)
-            elif not (0 <= (fr_max - self.buffer_startframe) < len(self.buffer)):
-                self.buffer_around(fr_max)
-
-            try:
-                result = np.zeros((len(tt), self.nchannels))
-                indices = frames - self.buffer_startframe
-                result[in_time] = self.buffer[indices]
-                return result
-
-            except IndexError as error:
-                warnings.warn(
-                    "Error in file %s, " % (self.filename)
-                    + "At time t=%.02f-%.02f seconds, " % (tt[0], tt[-1])
-                    + "indices wanted: %d-%d, " % (indices.min(), indices.max())
-                    + "but len(buffer)=%d\n" % (len(self.buffer))
-                    + str(error),
-                    UserWarning,
-                )
-
-                # repeat the last frame instead
-                indices[indices >= len(self.buffer)] = len(self.buffer) - 1
-                result[in_time] = self.buffer[indices]
-                return result
-
-        else:
-            ind = int(self.fps * tt)
-            if ind < 0 or ind > self.n_frames:  # out of time: return 0
+        if tt_array.ndim == 0:
+            if not (0 <= tt < self.duration):
                 return np.zeros(self.nchannels)
 
-            if not (0 <= (ind - self.buffer_startframe) < len(self.buffer)):
-                # out of the buffer: recenter the buffer
-                self.buffer_around(ind)
+            frame = self._frame_index(tt)
+            if frame < 0 or frame >= self.n_frames:
+                return np.zeros(self.nchannels)
 
-            # read the frame in the buffer
-            return self.buffer[ind - self.buffer_startframe]
+            return self._get_frame_from_buffer(frame)
+
+        if tt_array.ndim != 1:
+            raise ValueError("Audio timestamps must be a scalar or a 1D array")
+
+        if len(tt_array) == 0:
+            return np.zeros((0, self.nchannels))
+
+        # Keep the original request order and let np.unique collapse duplicates
+        # for decoding. The inverse indices restore duplicates and ordering.
+        in_time = (tt_array >= 0) & (tt_array < self.duration)
+        result = np.zeros((len(tt_array), self.nchannels))
+        if not in_time.any():
+            return result
+
+        frames = np.round(self.fps * tt_array[in_time]).astype(int)
+        in_time_indices = np.flatnonzero(in_time)
+        valid = (frames >= 0) & (frames < self.n_frames)
+        if not valid.any():
+            return result
+
+        frames = frames[valid]
+        in_time_indices = in_time_indices[valid]
+
+        unique_frames, inverse = np.unique(frames, return_inverse=True)
+        samples = np.empty((len(unique_frames), self.nchannels))
+        for i, frame in enumerate(unique_frames):
+            samples[i] = self._get_frame_from_buffer(frame)
+
+        result[in_time_indices] = samples[inverse]
+        return result
 
     def buffer_around(self, frame_number):
         """Fill the buffer with frames, centered on frame_number if possible."""

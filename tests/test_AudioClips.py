@@ -1,6 +1,8 @@
 """Image sequencing clip tests meant to be run with pytest."""
 
 import os
+import subprocess as sp
+import wave
 
 import numpy as np
 
@@ -13,6 +15,30 @@ from moviepy.audio.AudioClip import (
     concatenate_audioclips,
 )
 from moviepy.audio.io.AudioFileClip import AudioFileClip
+from moviepy.audio.io.readers import FFMPEG_AudioReader
+from moviepy.config import FFMPEG_BINARY
+
+
+def write_stereo_wav(filename, samples, fps):
+    """Write stereo samples as 16-bit PCM and return their decoded values."""
+    integer_samples = np.round(np.clip(samples, -1, 1) * 32767).astype("<i2")
+    with wave.open(filename, "wb") as wav_file:
+        wav_file.setnchannels(2)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(fps)
+        wav_file.writeframes(integer_samples.tobytes())
+    return integer_samples.astype(float) / 32768
+
+
+def expected_samples(samples, times, fps, duration, n_frames):
+    """Return the samples expected for arbitrary timestamps."""
+    frames = np.round(fps * times).astype(int)
+    in_time = (times >= 0) & (times < duration)
+    in_time &= (frames >= 0) & (frames < n_frames)
+
+    result = np.zeros((len(times), samples.shape[1]))
+    result[in_time] = samples[frames[in_time]]
+    return result
 
 
 def test_audioclip(util, mono_wave):
@@ -49,6 +75,218 @@ def test_audioclip_io(util):
         output_array[: len(input_array)], input_array, decimal=4
     )
     assert (output_array[len(input_array) :] == 0).all()
+
+
+def test_audiofileclip_arbitrary_times(util):
+    fps = 44100
+    n_frames = 2 * fps
+    rng = np.random.default_rng(1234)
+    samples = rng.uniform(-0.9, 0.9, size=(n_frames, 2))
+    filename = os.path.join(util.TMP_DIR, "audiofileclip_arbitrary_times.wav")
+    samples = write_stereo_wav(filename, samples, fps)
+
+    clip = AudioFileClip(filename, buffersize=32, fps=fps, nbytes=2)
+    try:
+        frames = np.array(
+            [
+                n_frames - 2,
+                0,
+                32,
+                32,
+                33,
+                1000,
+                1001,
+                30000,
+                30001,
+                60000,
+                60000,
+                120000,
+                7,
+            ]
+        )
+        times = np.concatenate(
+            [
+                frames / fps,
+                np.array([500.6, 500.6, 1200.4]) / fps,
+                np.array([-1 / fps, clip.duration, clip.duration + 1]),
+            ]
+        )
+        expected = expected_samples(
+            samples, times, fps, clip.duration, clip.reader.n_frames
+        )
+
+        np.testing.assert_array_equal(clip.get_frame(times), expected)
+
+        # Reading elsewhere first must not alter the result.
+        clip.get_frame(np.array([0.9, 0.1]))
+        np.testing.assert_array_equal(clip.get_frame(times), expected)
+
+        point_samples = np.array([clip.get_frame(float(t)) for t in times])
+        np.testing.assert_array_equal(point_samples, expected)
+
+        empty = clip.get_frame(np.array([], dtype=float))
+        assert empty.shape == (0, clip.nchannels)
+
+        out_of_time = np.array([-1.0, clip.duration, clip.duration + 10])
+        np.testing.assert_array_equal(
+            clip.get_frame(out_of_time), np.zeros((3, clip.nchannels))
+        )
+        np.testing.assert_array_equal(clip.get_frame(-1.0), np.zeros(clip.nchannels))
+        np.testing.assert_array_equal(
+            clip.get_frame(clip.duration), np.zeros(clip.nchannels)
+        )
+    finally:
+        clip.close()
+
+
+def test_audiofileclip_repeated_times_reuse_buffer(util, monkeypatch):
+    fps = 44100
+    n_frames = 3 * fps
+    rng = np.random.default_rng(5678)
+    samples = rng.uniform(-0.9, 0.9, size=(n_frames, 2))
+    filename = os.path.join(util.TMP_DIR, "audiofileclip_repeated_times.wav")
+    write_stereo_wav(filename, samples, fps)
+
+    initialize_calls = []
+    original_initialize = FFMPEG_AudioReader.initialize
+
+    def counting_initialize(reader, *args, **kwargs):
+        initialize_calls.append((args, kwargs))
+        return original_initialize(reader, *args, **kwargs)
+
+    monkeypatch.setattr(FFMPEG_AudioReader, "initialize", counting_initialize)
+
+    clip = AudioFileClip(filename, buffersize=128, fps=fps, nbytes=2)
+    try:
+        initialize_calls.clear()
+        frames = np.concatenate(
+            [
+                np.arange(1000, 2001),
+                np.repeat(np.array([12345, 12345, 12346, 12347]), 250),
+            ]
+        )
+        clip.get_frame(frames / fps)
+
+        # Adjacent and duplicate requests should be served from sliding buffers.
+        assert len(initialize_calls) <= 2
+        assert len(clip.reader.buffer) <= clip.reader.buffersize
+    finally:
+        clip.close()
+
+
+def test_audiofileclip_audio_stream_index_with_small_buffers(util):
+    fps = 44100
+    n_frames = 2 * fps
+    rng = np.random.default_rng(9012)
+    track_samples = []
+    source_filenames = []
+    for index in range(2):
+        samples = rng.uniform(-0.9, 0.9, size=(n_frames, 2))
+        filename = os.path.join(util.TMP_DIR, f"dual_audio_source_{index}.wav")
+        track_samples.append(write_stereo_wav(filename, samples, fps))
+        source_filenames.append(filename)
+
+    filename = os.path.join(util.TMP_DIR, "dual_audio_streams.mkv")
+    sp.run(
+        [
+            FFMPEG_BINARY,
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            source_filenames[0],
+            "-i",
+            source_filenames[1],
+            "-map",
+            "0:a",
+            "-map",
+            "1:a",
+            "-c:a",
+            "pcm_s16le",
+            filename,
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    frames = np.array(
+        [
+            n_frames - 2,
+            0,
+            64,
+            64,
+            65,
+            5000,
+            20000,
+            20000,
+            40000,
+            7,
+            60000,
+        ]
+    )
+    times = np.concatenate(
+        [
+            frames / fps,
+            np.array([-0.1, 2.0, 2.5]),
+        ]
+    )
+
+    selected_arrays = []
+    for audio_stream_index in range(2):
+        clip = AudioFileClip(
+            filename,
+            buffersize=64,
+            fps=fps,
+            nbytes=2,
+            audio_stream_index=audio_stream_index,
+        )
+        try:
+            expected = expected_samples(
+                track_samples[audio_stream_index],
+                times,
+                fps,
+                clip.duration,
+                clip.reader.n_frames,
+            )
+            np.testing.assert_array_equal(clip.get_frame(times), expected)
+
+            # Jump around, then go back to the beginning.
+            clip.get_frame(np.array([1.8, 0.2, 1.7]))
+            np.testing.assert_array_equal(clip.get_frame(times), expected)
+
+            clip.reader.initialize(0)
+            np.testing.assert_array_equal(clip.get_frame(times), expected)
+
+            reopened = AudioFileClip(
+                filename,
+                buffersize=64,
+                fps=fps,
+                nbytes=2,
+                audio_stream_index=audio_stream_index,
+            )
+            try:
+                np.testing.assert_array_equal(reopened.get_frame(times), expected)
+            finally:
+                reopened.close()
+
+            selected_arrays.append(clip.get_frame(times))
+            assert len(clip.reader.buffer) <= clip.reader.buffersize
+        finally:
+            clip.close()
+
+    assert not np.array_equal(selected_arrays[0], selected_arrays[1])
+
+    default_clip = AudioFileClip(filename, buffersize=64, fps=fps, nbytes=2)
+    explicit_default = AudioFileClip(
+        filename, buffersize=64, fps=fps, nbytes=2, audio_stream_index=0
+    )
+    try:
+        np.testing.assert_array_equal(
+            default_clip.get_frame(times), explicit_default.get_frame(times)
+        )
+    finally:
+        default_clip.close()
+        explicit_default.close()
 
 
 def test_concatenate_audioclips_render(util, mono_wave):
