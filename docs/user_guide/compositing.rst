@@ -34,6 +34,31 @@ The ``final_clip`` is a clip that plays the clips 1, 2, and 3 one after the othe
 .. note::
     The clips do not need to be the same size. If they aren't, they will all appear centered in a clip large enough to contain the biggest of them, with optionally a color of your choosing to fill the background.
 
+Each boundary between two consecutive clips can also have its own duration with
+the ``gaps`` argument. There must be exactly one value for each boundary:
+``len(clips) - 1``. A positive value inserts a blank interval, while a negative
+value makes the clips overlap. The output uses a fixed canvas whose size is
+large enough for every clip, and smaller clips are centered.
+
+.. code:: python
+
+    final_clip = concatenate_videoclips(
+        [clip1, clip2, clip3],
+        gaps=[0.5, -0.25],
+        bg_color=None,
+    )
+
+Here ``clip1`` and ``clip2`` are separated by half a second, while ``clip3``
+starts a quarter of a second before ``clip2`` ends. Gaps are shown using
+``bg_color``; use ``bg_color=None`` for a transparent background. Audio is
+silent in blank intervals and is mixed according to each clip's start time when
+clips overlap. A later clip is rendered above an earlier one.
+
+``gaps`` cannot be combined with ``transition`` or a non-zero ``padding``. Each
+overlap must be shorter than both adjacent clips. The older uniform ``padding``
+argument remains available, and a non-zero value selects the ``compose`` method
+automatically.
+
 For more info, see :py:func:`~moviepy.video.compositing.CompositeVideoClip.concatenate_videoclips`.
 
 Juxtaposing Multiple Clips

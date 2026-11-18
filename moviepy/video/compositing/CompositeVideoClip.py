@@ -1,6 +1,7 @@
 """Main video composition interface of MoviePy."""
 
 from functools import reduce
+from numbers import Real
 
 import numpy as np
 
@@ -296,7 +297,13 @@ def clips_array(array, rows_widths=None, cols_heights=None, bg_color=None):
 
 
 def concatenate_videoclips(
-    clips, method="chain", transition=None, bg_color=None, is_mask=False, padding=0
+    clips,
+    method="chain",
+    transition=None,
+    bg_color=None,
+    is_mask=False,
+    padding=0,
+    gaps=None,
 ):
     """Concatenates several video clips.
 
@@ -343,11 +350,120 @@ def concatenate_videoclips(
       in on one another). A non-null padding automatically sets the method to
       `compose`.
 
+    gaps
+      A sequence of durations, one for each boundary between two consecutive
+      clips. A positive value inserts a blank interval and a negative value
+      makes the clips overlap. The result always uses a fixed-size composition
+      and the ``method`` argument is ignored. ``gaps`` cannot be combined with
+      ``transition`` or a non-zero ``padding``. An overlap must be shorter than
+      both adjacent clips.
+
     """
+    clips = list(clips)
+
+    if gaps is not None:
+        if transition is not None:
+            raise ValueError(
+                "The 'gaps' argument cannot be used together with 'transition'."
+            )
+        if padding != 0:
+            raise ValueError(
+                "The 'gaps' argument cannot be used together with a non-zero "
+                "'padding'."
+            )
+
+        try:
+            gaps = list(gaps)
+        except TypeError as error:
+            raise ValueError("The 'gaps' argument must be a sequence.") from error
+
+        expected_gaps = max(0, len(clips) - 1)
+        if len(gaps) != expected_gaps:
+            raise ValueError(
+                "The 'gaps' argument must contain exactly one duration per "
+                "boundary between consecutive clips: expected %d, got %d."
+                % (expected_gaps, len(gaps))
+            )
+
+        for index, gap in enumerate(gaps):
+            if isinstance(gap, bool) or not isinstance(gap, Real):
+                raise ValueError(
+                    "Gap %d must be a finite real number, got %r."
+                    % (index, gap)
+                )
+            if not np.isfinite(gap):
+                raise ValueError(
+                    "Gap %d must be finite, got %r." % (index, gap)
+                )
+            if gap < 0:
+                overlap = -gap
+                if overlap >= clips[index].duration:
+                    raise ValueError(
+                        "The overlap at gap %d must be shorter than the clip "
+                        "before it." % index
+                    )
+                if overlap >= clips[index + 1].duration:
+                    raise ValueError(
+                        "The overlap at gap %d must be shorter than the clip "
+                        "after it." % index
+                    )
+
+        starts = np.cumsum(
+            [0] + [clip.duration + gap for clip, gap in zip(clips, gaps)]
+        )
+        timings = np.append(starts, starts[-1] + clips[-1].duration)
+
+        sizes = [clip.size for clip in clips]
+        w = max(size[0] for size in sizes)
+        h = max(size[1] for size in sizes)
+
+        result = CompositeVideoClip(
+            [
+                clip.with_start(start)
+                .with_position("center")
+                .with_layer_index(index)
+                for index, (clip, start) in enumerate(zip(clips, starts))
+            ],
+            size=(w, h),
+            bg_color=bg_color,
+            is_mask=is_mask,
+        )
+
+        result.timings = timings
+        result.start_times = starts
+        result.start, result.duration, result.end = 0, timings[-1], timings[-1]
+
+        audio_clips = []
+        for clip, start in zip(clips, starts):
+            if clip.audio is None:
+                continue
+            audio = clip.audio
+            if audio.duration is None or audio.duration > clip.duration:
+                audio = audio.with_duration(clip.duration)
+            audio_clips.append(audio.with_start(start))
+        if audio_clips:
+            result.audio = CompositeAudioClip(audio_clips).with_duration(
+                result.duration
+            )
+
+        if result.mask is not None:
+            result.mask.start = 0
+            result.mask.duration = result.duration
+            result.mask.end = result.duration
+
+        fpss = [
+            clip.fps for clip in clips if getattr(clip, "fps", None) is not None
+        ]
+        result.fps = max(fpss) if fpss else None
+        return result
+
     if transition is not None:
         clip_transition_pairs = [[v, transition] for v in clips[:-1]]
         clips = reduce(lambda x, y: x + y, clip_transition_pairs) + [clips[-1]]
         transition = None
+
+    if padding != 0:
+        method = "compose"
 
     timings = np.cumsum([0] + [clip.duration for clip in clips])
 
@@ -368,7 +484,9 @@ def concatenate_videoclips(
         def get_mask(clip):
             mask = clip.mask or ColorClip(clip.size, color=1, is_mask=True)
             if mask.duration is None:
+                mask = mask.copy()
                 mask.duration = clip.duration
+                mask.end = mask.start + clip.duration
             return mask
 
         result = VideoClip(is_mask=is_mask, frame_function=frame_function)

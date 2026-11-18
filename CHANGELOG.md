@@ -20,9 +20,11 @@ This mean you need to specifically set `bg_color=None` if you want to generate a
 
 ### Added
 - Possibility to select audio track when reading a file (#2429)
+- Add per-boundary `gaps` to `concatenate_videoclips` for independently spacing or overlapping adjacent clips
 
 ### Changed 
 - Rewrite FFmpegInfosParser to use indentation and block extractions instead of a state machine (PR #2470)
+- Non-zero `padding` in `concatenate_videoclips` now selects the documented `compose` method automatically
 
 ## v2.2.1
 

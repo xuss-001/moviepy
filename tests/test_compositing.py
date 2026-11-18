@@ -31,6 +31,59 @@ class ClipPixelTest:
         )
 
 
+def _tone_audio(value, duration, fps=8000):
+    def frame_function(t):
+        if isinstance(t, np.ndarray):
+            return np.full((len(t), 1), value, dtype=float)
+        return np.array([value])
+
+    return AudioClip(frame_function, duration=duration, fps=fps)
+
+
+def _gap_test_clips():
+    first = (
+        ColorClip((8, 6), color=(255, 0, 0), duration=1)
+        .with_fps(4)
+        .with_audio(_tone_audio(0.1, 1.5))
+    )
+    second = (
+        ColorClip((4, 2), color=(0, 255, 0, 128), duration=2)
+        .with_fps(4)
+        .with_audio(_tone_audio(0.2, 2))
+    )
+    third = (
+        ColorClip((6, 4), color=(0, 0, 255, 128), duration=1)
+        .with_fps(4)
+        .with_audio(_tone_audio(0.3, 1))
+    )
+    return [first, second, third]
+
+
+def _clip_state(clip):
+    mask = clip.mask
+    audio = clip.audio
+    return (
+        clip.start,
+        clip.end,
+        clip.duration,
+        clip.pos(0),
+        clip.layer_index,
+        clip.get_frame(0).tobytes(),
+        None
+        if mask is None
+        else (
+            mask.start,
+            mask.end,
+            mask.duration,
+            mask.pos(0),
+            mask.layer_index,
+        ),
+        None
+        if audio is None
+        else (audio.start, audio.end, audio.duration),
+    )
+
+
 def test_clips_array(util):
     red = ColorClip((1024, 800), color=(255, 0, 0))
     green = ColorClip((1024, 800), color=(0, 255, 0))
@@ -312,6 +365,153 @@ def test_concatenate_with_masks(util):
     concatenate_videoclips([video_without_mask, video_with_mask]).write_videofile(
         output
     )
+
+
+def test_concatenate_with_gaps_timeline_video_mask_and_audio():
+    clips = _gap_test_clips()
+    original_states = [_clip_state(clip) for clip in clips]
+
+    result = concatenate_videoclips(clips, gaps=[0.5, -0.4], bg_color=None)
+
+    assert result.size == (8, 6)
+    assert result.duration == pytest.approx(4.1)
+    assert result.end == pytest.approx(4.1)
+    assert result.timings == pytest.approx([0, 1.5, 3.1, 4.1])
+    assert result.start_times == pytest.approx([0, 1.5, 3.1])
+    assert result.mask is not None
+    assert result.mask.duration == pytest.approx(4.1)
+    assert result.mask.end == pytest.approx(4.1)
+
+    # The first clip ends at 1.0 and the second starts at 1.5. The interval is
+    # transparent when no background color is requested and contains no audio.
+    frame = result.get_frame(1.2)
+    mask = result.mask.get_frame(1.2)
+    assert np.all(mask == 0)
+    np.testing.assert_array_equal(frame, np.zeros_like(frame))
+    assert result.audio.get_frame(1.2)[0] == pytest.approx(0)
+
+    colored_gap = concatenate_videoclips(
+        _gap_test_clips(), gaps=[0.5, -0.4], bg_color=(1, 2, 3)
+    )
+    assert colored_gap.mask is None
+    np.testing.assert_array_equal(colored_gap.get_frame(1.2)[0, 0], [1, 2, 3])
+
+    # A smaller, semi-transparent clip is centered on the fixed canvas.
+    frame = result.get_frame(1.75)
+    mask = result.mask.get_frame(1.75)
+    np.testing.assert_allclose(frame[3, 4], [0, 255, 0], atol=1)
+    assert mask[3, 4] == pytest.approx(128 / 255, abs=0.01)
+    assert result.audio.get_frame(1.75)[0] == pytest.approx(0.2)
+
+    # The third clip starts at 3.1, while the second still plays until 3.5.
+    # The later clip is on top and both alpha values are composited correctly.
+    frame = result.get_frame(3.2)
+    mask = result.mask.get_frame(3.2)
+    np.testing.assert_allclose(frame[3, 4], [0, 85, 170], atol=2)
+    assert mask[3, 4] == pytest.approx(0.752, abs=0.01)
+    assert result.audio.get_frame(3.2)[0] == pytest.approx(0.5)
+
+    # The total duration ends with the last clip, without trailing blank time.
+    frame = result.get_frame(4.05)
+    mask = result.mask.get_frame(4.05)
+    np.testing.assert_allclose(frame[3, 4], [0, 0, 255], atol=1)
+    assert mask[3, 4] == pytest.approx(128 / 255, abs=0.01)
+    assert result.audio.get_frame(4.05)[0] == pytest.approx(0.3)
+
+    assert [_clip_state(clip) for clip in clips] == original_states
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "transition",
+        "padding",
+        "wrong_count",
+        "not_a_sequence",
+        "nan",
+        "infinity",
+        "overlap_previous",
+        "overlap_next",
+    ],
+)
+def test_concatenate_with_gaps_rejects_invalid_combinations(case):
+    clips = [
+        ColorClip((4, 4), color=(255, 0, 0), duration=1),
+        ColorClip((4, 4), color=(0, 255, 0), duration=1),
+        ColorClip((4, 4), color=(0, 0, 255), duration=1),
+    ]
+
+    if case == "transition":
+        kwargs = {
+            "gaps": [0, 0],
+            "transition": ColorClip((4, 4), color=(0, 0, 0), duration=0.1),
+        }
+    elif case == "padding":
+        kwargs = {"gaps": [0, 0], "padding": 0.1}
+    elif case == "wrong_count":
+        kwargs = {"gaps": [0]}
+    elif case == "not_a_sequence":
+        kwargs = {"gaps": 0}
+    elif case == "nan":
+        kwargs = {"gaps": [np.nan, 0]}
+    elif case == "infinity":
+        kwargs = {"gaps": [0, np.inf]}
+    elif case == "overlap_previous":
+        kwargs = {"gaps": [-1, 0]}
+    else:
+        kwargs = {"gaps": [0, -1]}
+
+    with pytest.raises(ValueError):
+        concatenate_videoclips(clips, **kwargs)
+
+
+def test_concatenate_padding_and_transition_compatibility():
+    first = ColorClip((8, 6), color=(255, 0, 0), duration=1).with_fps(2)
+    second = ColorClip((4, 2), color=(0, 255, 0), duration=1).with_fps(2)
+
+    chained = concatenate_videoclips([first, second])
+    assert not isinstance(chained, CompositeVideoClip)
+    assert chained.duration == pytest.approx(2)
+    assert chained.mask is None
+
+    padded = concatenate_videoclips([first, second], padding=0.25)
+    assert isinstance(padded, CompositeVideoClip)
+    assert padded.size == (8, 6)
+    assert padded.duration == pytest.approx(2.25)
+    assert padded.start_times == pytest.approx([0, 1.25])
+
+    overlapped = concatenate_videoclips([first, second], padding=-0.25)
+    assert isinstance(overlapped, CompositeVideoClip)
+    assert overlapped.duration == pytest.approx(1.75)
+
+    transition = ColorClip((4, 2), color=(0, 0, 0), duration=0.5)
+    with_transition = concatenate_videoclips([first, second], transition=transition)
+    assert with_transition.duration == pytest.approx(2.5)
+
+
+def test_concatenate_with_gaps_exports_video_with_audio(util):
+    clips = _gap_test_clips()
+    result = concatenate_videoclips(clips, gaps=[0.5, -0.4], bg_color=None)
+    output = os.path.join(util.TMP_DIR, "test_concatenate_with_gaps.webm")
+
+    result.write_videofile(
+        output,
+        fps=4,
+        codec="libvpx",
+        audio_codec="libvorbis",
+        bitrate="50k",
+        audio_bitrate="32k",
+        logger=None,
+    )
+
+    exported = VideoFileClip(output)
+    try:
+        assert exported.size == [8, 6]
+        assert exported.duration == pytest.approx(result.duration, abs=0.1)
+        assert exported.audio is not None
+        assert exported.audio.duration == pytest.approx(result.duration, abs=0.1)
+    finally:
+        exported.close()
 
 
 if __name__ == "__main__":
