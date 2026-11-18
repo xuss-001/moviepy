@@ -4,6 +4,7 @@ out of VideoClips
 """
 
 import subprocess as sp
+import sys
 
 import numpy as np
 from proglog import proglog
@@ -242,13 +243,29 @@ class FFMPEG_VideoWriter:
 
     def close(self):
         """Closes the writer, terminating the subprocess if is still alive."""
-        if self.proc:
-            self.proc.stdin.close()
-            if self.proc.stderr is not None:
-                self.proc.stderr.close()
-            self.proc.wait()
+        proc = getattr(self, "proc", None)
+        if proc is None:
+            return
+        self.proc = None
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except OSError:
+                # The ffmpeg process may have already exited, which
+                # breaks the pipe. Nothing left to clean up here.
+                pass
+            proc.stdin = None
+        if proc.stderr is not None:
+            try:
+                proc.stderr.close()
+            except OSError:
+                pass
+            proc.stderr = None
+        proc.wait()
 
-            self.proc = None
+    def __del__(self):
+        # If the garbage collector comes, make sure the subprocess is terminated.
+        self.close()
 
     # Support the Context Manager protocol, to ensure that resources are cleaned up.
 
@@ -288,34 +305,40 @@ def ffmpeg_write_video(
 
     has_mask = clip.mask is not None
 
-    with FFMPEG_VideoWriter(
-        filename,
-        clip.size,
-        fps,
-        codec=codec,
-        preset=preset,
-        bitrate=bitrate,
-        with_mask=has_mask,
-        logfile=logfile,
-        audiofile=audiofile,
-        audio_codec=audio_codec,
-        threads=threads,
-        ffmpeg_params=ffmpeg_params,
-        pixel_format=pixel_format,
-    ) as writer:
-        for t, frame in clip.iter_frames(
-            logger=logger, with_times=True, fps=fps, dtype="uint8"
-        ):
-            if clip.mask is not None:
-                mask = 255 * clip.mask.get_frame(t)
-                if mask.dtype != "uint8":
-                    mask = mask.astype("uint8")
-                frame = np.dstack([frame, mask])
+    try:
+        with FFMPEG_VideoWriter(
+            filename,
+            clip.size,
+            fps,
+            codec=codec,
+            preset=preset,
+            bitrate=bitrate,
+            with_mask=has_mask,
+            logfile=logfile,
+            audiofile=audiofile,
+            audio_codec=audio_codec,
+            threads=threads,
+            ffmpeg_params=ffmpeg_params,
+            pixel_format=pixel_format,
+        ) as writer:
+            for t, frame in clip.iter_frames(
+                logger=logger, with_times=True, fps=fps, dtype="uint8"
+            ):
+                if clip.mask is not None:
+                    mask = 255 * clip.mask.get_frame(t)
+                    if mask.dtype != "uint8":
+                        mask = mask.astype("uint8")
+                    frame = np.dstack([frame, mask])
 
-            writer.write_frame(frame)
-
-    if write_logfile:
-        logfile.close()
+                writer.write_frame(frame)
+    finally:
+        if logfile is not None:
+            try:
+                logfile.close()
+            except Exception:
+                # Don't let a cleanup error hide the original export error.
+                if sys.exc_info()[1] is None:
+                    raise
     logger(message="MoviePy - Done !")
 
 
