@@ -20,6 +20,7 @@ This mean you need to specifically set `bg_color=None` if you want to generate a
 
 ### Added
 - Possibility to select audio track when reading a file (#2429)
+- `ImageSequenceClip` now supports sequences mixing RGB and RGBA images (RGB images are treated as opaque), per-image `durations` (zero-duration images are skipped), exact switching at each image start time, and lazy decoding of file-based sequences without re-decoding unchanged frames
 
 ### Changed 
 - Rewrite FFmpegInfosParser to use indentation and block extractions instead of a state machine (PR #2470)

@@ -104,7 +104,9 @@ This :py:class:`~moviepy.video.io.ImageSequenceClip.ImageSequenceClip` is a clip
 When creating an image sequence, ``sequence`` can be either a list of image names (that will be *played* in the provided order), a folder name (played in alphanumerical order), or a list of frames (Numpy arrays), obtained for instance from other clips.
 
 .. warning::
-    All the images in the list/folder/frames must be of the same size, or an exception will be raised.
+    All the images in the list/folder/frames must have the same width and height, or an exception will be raised. They may however mix RGB and RGBA pictures: RGB pictures are treated as fully opaque, while the transparency of RGBA pictures is preserved in the clip's mask (unless ``with_mask=False``).
+
+Instead of ``fps``, you can provide ``durations``, a list with one finite, non-negative duration per image (images with a duration of 0 are skipped, and the total duration must be greater than 0). Each image then appears exactly at its start time and is replaced when the next one starts. If both ``fps`` and ``durations`` are provided, ``fps`` takes precedence.
 
 For more, see :py:class:`~moviepy.video.io.ImageSequenceClip.ImageSequenceClip`.
 
