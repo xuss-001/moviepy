@@ -1515,6 +1515,330 @@ def test_audio_fadein(
         assert round(subclip_max_volume, 4) == 1
 
 
+def _duck_volume_control_clip():
+    """Builds a stereo control clip (fps=1000, duration=3s, start=0.5) with
+    voice activity spread over both channels:
+
+    - channel 0 active on local times [0.0, 0.3) and [2.9, 3.0)
+    - channel 1 active on local times [0.5, 0.7) and [0.8, 0.9)
+
+    With ``hold_time=0.15`` this gives the speech segments (on the common
+    timeline, i.e. shifted by ``start=0.5``): [0.5, 0.8], [1.0, 1.4] and
+    [3.4, 3.5] (the last one being truncated to the end of the clip).
+    """
+    fps = 1000
+    duration = 3.0
+    data = np.zeros((int(fps * duration), 2))
+    for channel, start, end in (
+        (0, 0.0, 0.3),
+        (0, 2.9, 3.0),
+        (1, 0.5, 0.7),
+        (1, 0.8, 0.9),
+    ):
+        data[int(start * fps) : int(end * fps), channel] = 0.5
+    return AudioArrayClip(data, fps=fps).with_start(0.5)
+
+
+def _duck_volume_music(start=0.0, duration=5.0, fps=8000):
+    """Builds a stereo music clip with constant channels [0.5, -0.3]."""
+
+    def frame_function(t):
+        t = np.asarray(t, dtype=float)
+        return np.stack(
+            [0.5 * np.ones_like(t), -0.3 * np.ones_like(t)], axis=-1
+        )
+
+    return AudioClip(frame_function, duration=duration, fps=fps).with_start(start)
+
+
+def _mono_constant_frame(t):
+    """Mono frame function returning a constant value of 1.0."""
+    t = np.asarray(t, dtype=float)
+    if t.ndim == 0:
+        return 1.0
+    return np.ones(t.shape)
+
+
+# speech segments of ``_duck_volume_control_clip`` on the common timeline
+DUCK_VOLUME_SEGMENTS = ((0.5, 0.8), (1.0, 1.4), (3.4, 3.5))
+
+
+def _duck_volume_expected_volume(t, segments=DUCK_VOLUME_SEGMENTS, factor=0.25,
+                                 attack=0.1, release=0.2):
+    volume = 1.0
+    for segment_start, segment_end in segments:
+        segment_volume = 1.0
+        if segment_start - attack <= t < segment_start:
+            segment_volume = 1.0 - (1.0 - factor) * (
+                t - (segment_start - attack)
+            ) / attack
+        elif segment_start <= t < segment_end:
+            segment_volume = factor
+        elif segment_end <= t < segment_end + release:
+            segment_volume = factor + (1.0 - factor) * (t - segment_end) / release
+        volume = min(volume, segment_volume)
+    return volume
+
+
+def test_duck_volume_envelope_and_time_alignment():
+    control = _duck_volume_control_clip()
+    music = _duck_volume_music(start=0.2)
+    music_frame_before = music.get_frame(1.0)
+
+    ducked = music.with_effects(
+        [
+            afx.DuckVolume(
+                control,
+                factor=0.25,
+                threshold=0.1,
+                attack_time=0.1,
+                release_time=0.2,
+                hold_time=0.15,
+            )
+        ]
+    )
+
+    # duration, fps and start of the target are preserved
+    assert ducked.duration == music.duration
+    assert ducked.fps == music.fps
+    assert ducked.start == music.start
+
+    # input clips are not modified
+    assert np.array_equal(music.get_frame(1.0), music_frame_before)
+    assert control.get_frame(0.1)[0] == 0.5
+
+    # point-wise reads: times are aligned using the ``start`` of each clip,
+    # attack/release transitions extend outside of the control clip and
+    # overlapping transitions keep the lowest volume
+    global_times = [0.1, 0.45, 0.65, 0.9, 0.95, 1.2, 1.5, 3.45, 3.6, 4.0]
+    for global_time in global_times:
+        frame = ducked.get_frame(global_time - music.start)
+        expected = _duck_volume_expected_volume(global_time)
+        assert frame == pytest.approx(
+            np.array([0.5, -0.3]) * expected, abs=1e-9
+        )
+        # relative volume of the channels is preserved
+        assert frame[0] / frame[1] == pytest.approx(0.5 / -0.3)
+
+    # batch reads give the same result as point-wise reads
+    local_times = np.array(global_times) - music.start
+    batch_frames = ducked.get_frame(local_times)
+    for i, global_time in enumerate(global_times):
+        assert batch_frames[i] == pytest.approx(
+            np.array([0.5, -0.3]) * _duck_volume_expected_volume(global_time),
+            abs=1e-9,
+        )
+
+    # out-of-order reads give the same result as ordered reads
+    shuffled = local_times[::-1]
+    shuffled_frames = ducked.get_frame(shuffled)
+    assert np.array_equal(shuffled_frames[::-1], batch_frames)
+
+    # chunked reads give the same result as point-wise reads
+    chunked = np.vstack(
+        list(ducked.iter_chunks(chunksize=7000, fps=music.fps, logger=None))
+    )
+    chunk_times = np.arange(0, music.duration, 1.0 / music.fps)
+    expected = np.array(
+        [
+            _duck_volume_expected_volume(t + music.start)
+            for t in chunk_times
+        ]
+    )
+    expected_frames = np.stack([0.5 * expected, -0.3 * expected], axis=-1)
+    assert chunked.shape == expected_frames.shape
+    assert np.allclose(chunked, expected_frames, atol=1e-9)
+
+
+def test_duck_volume_mono_target():
+    control = _duck_volume_control_clip()
+    music = AudioClip(_mono_constant_frame, duration=5.0, fps=8000)
+    ducked = music.with_effects(
+        [
+            afx.DuckVolume(
+                control, factor=0.25, threshold=0.1, attack_time=0.1,
+                release_time=0.2, hold_time=0.15,
+            )
+        ]
+    )
+    assert ducked.get_frame(0.65) == pytest.approx(0.25)
+    assert ducked.get_frame(2.0) == pytest.approx(1.0)
+    batch = ducked.get_frame(np.array([0.65, 2.0]))
+    assert batch == pytest.approx(np.array([0.25, 1.0]))
+
+
+def test_duck_volume_video_clip():
+    control = _duck_volume_control_clip()
+    # the video is aligned using the start of its own audio track
+    audio = _duck_volume_music(start=0.3, duration=2.0)
+    video = (
+        ColorClip((64, 64), color=(255, 0, 0), duration=2.0)
+        .with_fps(24)
+        .with_audio(audio)
+    )
+    audio_frame_before = video.audio.get_frame(0.45)
+
+    ducked_video = video.with_effects(
+        [
+            afx.DuckVolume(
+                control, factor=0.25, threshold=0.1, attack_time=0.1,
+                release_time=0.2, hold_time=0.15,
+            )
+        ]
+    )
+
+    # video is preserved, only its audio is ducked
+    assert ducked_video.duration == video.duration
+    assert ducked_video.fps == video.fps
+    assert np.array_equal(ducked_video.get_frame(0.5), video.get_frame(0.5))
+    assert np.array_equal(video.audio.get_frame(0.45), audio_frame_before)
+    # local time 0.15 of the audio track is global time 0.15 + 0.3 = 0.45
+    expected = _duck_volume_expected_volume(0.15 + audio.start)
+    assert ducked_video.audio.get_frame(0.15) == pytest.approx(
+        np.array([0.5, -0.3]) * expected, abs=1e-9
+    )
+
+    # a video clip without audio track is an error
+    silent_video = ColorClip((64, 64), color=(0, 0, 0), duration=1.0)
+    with pytest.raises(ValueError, match="audio"):
+        silent_video.with_effects([afx.DuckVolume(control, factor=0.25)])
+
+
+def test_duck_volume_wav_roundtrip(tmp_path):
+    control = _duck_volume_control_clip()
+    music = _duck_volume_music()
+    ducked = music.with_effects(
+        [
+            afx.DuckVolume(
+                control, factor=0.25, threshold=0.1, attack_time=0.1,
+                release_time=0.2, hold_time=0.15,
+            )
+        ]
+    )
+
+    filename = str(tmp_path / "ducked.wav")
+    ducked.write_audiofile(filename, fps=music.fps, logger=None)
+
+    reread = AudioFileClip(filename)
+    expected = ducked.to_soundarray(fps=music.fps)
+    actual = reread.to_soundarray(fps=music.fps)
+    assert actual.shape == expected.shape
+    assert np.allclose(actual, expected, atol=1e-3)
+
+
+def test_duck_volume_zero_attack_and_release():
+    fps = 1000
+    data = np.zeros((2 * fps, 1))
+    data[500:1000] = 0.5  # active on [0.5, 1.0)
+    control = AudioArrayClip(data, fps=fps)
+    music = AudioClip(_mono_constant_frame, duration=2.0, fps=8000)
+    ducked = music.with_effects(
+        [
+            afx.DuckVolume(
+                control, factor=0.2, threshold=0.1, attack_time=0,
+                release_time=0, hold_time=0,
+            )
+        ]
+    )
+    # immediate switch at the segment boundaries
+    assert float(ducked.get_frame(0.499)) == pytest.approx(1.0)
+    assert float(ducked.get_frame(0.5)) == pytest.approx(0.2)
+    assert float(ducked.get_frame(0.999)) == pytest.approx(0.2)
+    assert float(ducked.get_frame(1.0)) == pytest.approx(1.0)
+
+
+def test_duck_volume_hold_time_boundary():
+    fps = 1000
+    data = np.zeros((2 * fps, 1))
+    data[200:500] = 0.5  # active on [0.2, 0.5)
+    data[650:900] = 0.5  # active on [0.65, 0.9)
+    control = AudioArrayClip(data, fps=fps)
+    music = AudioClip(_mono_constant_frame, duration=2.0, fps=8000)
+    # exact silence gap between the two active parts, computed the same
+    # way the effect computes it
+    gap = 650 / fps - 500 / fps
+
+    # a gap equal to ``hold_time`` is not merged: volume restores in between
+    ducked = music.with_effects(
+        [
+            afx.DuckVolume(
+                control, factor=0.2, threshold=0.1, attack_time=0,
+                release_time=0, hold_time=gap,
+            )
+        ]
+    )
+    assert float(ducked.get_frame(0.575)) == pytest.approx(1.0)
+
+    # a gap shorter than ``hold_time`` is merged: volume stays low
+    ducked = music.with_effects(
+        [
+            afx.DuckVolume(
+                control, factor=0.2, threshold=0.1, attack_time=0,
+                release_time=0, hold_time=gap + 0.01,
+            )
+        ]
+    )
+    assert float(ducked.get_frame(0.575)) == pytest.approx(0.2)
+
+
+def test_duck_volume_threshold_is_strict():
+    fps = 1000
+    music = AudioClip(_mono_constant_frame, duration=1.0, fps=8000)
+
+    # amplitude exactly equal to the threshold is not active
+    control = AudioArrayClip(np.full((fps, 1), 0.1), fps=fps)
+    ducked = music.with_effects(
+        [afx.DuckVolume(control, factor=0.2, threshold=0.1)]
+    )
+    assert float(ducked.get_frame(0.5)) == pytest.approx(1.0)
+
+    # amplitude strictly greater than the threshold is active
+    control = AudioArrayClip(np.full((fps, 1), 0.1 + 1e-9), fps=fps)
+    ducked = music.with_effects(
+        [afx.DuckVolume(control, factor=0.2, threshold=0.1)]
+    )
+    assert float(ducked.get_frame(0.5)) == pytest.approx(0.2)
+
+
+def test_duck_volume_invalid_parameters():
+    control = _duck_volume_control_clip()
+    invalid_kwargs = (
+        {"factor": 1.5},
+        {"factor": -0.1},
+        {"factor": np.nan},
+        {"factor": 0.25, "threshold": -0.1},
+        {"factor": 0.25, "threshold": np.inf},
+        {"factor": 0.25, "attack_time": -0.1},
+        {"factor": 0.25, "release_time": -0.1},
+        {"factor": 0.25, "hold_time": -0.1},
+        {"factor": 0.25, "hold_time": np.inf},
+    )
+    for kwargs in invalid_kwargs:
+        with pytest.raises(ValueError):
+            afx.DuckVolume(control, **kwargs)
+
+
+def test_duck_volume_missing_clip_information():
+    music = AudioClip(_mono_constant_frame, duration=1.0, fps=8000)
+    frame_function = _mono_constant_frame
+
+    # control clip without duration
+    control = AudioClip(frame_function, fps=1000)
+    with pytest.raises(ValueError, match="duration"):
+        music.with_effects([afx.DuckVolume(control, factor=0.25)])
+
+    # control clip without fps
+    control = AudioClip(frame_function, duration=1.0)
+    with pytest.raises(ValueError, match="fps"):
+        music.with_effects([afx.DuckVolume(control, factor=0.25)])
+
+    # control clip with a non-positive fps
+    control = AudioClip(frame_function, duration=1.0, fps=1000)
+    control.fps = 0
+    with pytest.raises(ValueError, match="fps"):
+        music.with_effects([afx.DuckVolume(control, factor=0.25)])
+
+
 @pytest.mark.parametrize("sound_type", ("stereo", "mono"))
 @pytest.mark.parametrize("fps", (44100, 22050))
 @pytest.mark.parametrize(

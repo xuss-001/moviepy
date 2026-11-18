@@ -8,7 +8,8 @@ import numpy as np
 
 import pytest
 
-from moviepy.audio.AudioClip import AudioClip
+from moviepy.audio.AudioClip import AudioArrayClip, AudioClip
+from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.config import FFMPEG_BINARY
 from moviepy.tools import ffmpeg_escape_filename
 from moviepy.video.compositing.CompositeVideoClip import clips_array
@@ -895,6 +896,29 @@ def test_side_data():
         d["blocks"].childs[1].childs[1].data["DOVI configuration record"]
         == "version: 1.0, profile: 8, level: 4, rpu flag: 1, el flag: 0, bl flag: 1, compatibility id: 4"
     )
+
+
+def test_audio_reader_batch_read_spanning_buffer(tmp_path):
+    """Batch reads whose frames span more than half the reader buffer must
+    return the same frames as point reads (regression test: the recursive
+    split of ``FFMPEG_AudioReader.get_frame`` used to forward the boolean
+    ``in_time`` mask instead of the requested times).
+    """
+    fps = 8000
+    duration = 4.0
+    tt = np.arange(int(fps * duration)) / fps
+    # ramp signal so any misalignment is visible in the values
+    data = np.stack([0.1 * tt, -0.1 * tt], axis=-1)
+    filename = str(tmp_path / "ramp.wav")
+    AudioArrayClip(data, fps=fps).write_audiofile(filename, fps=fps, logger=None)
+
+    clip = AudioFileClip(filename, fps=fps)
+    batch = clip.to_soundarray(fps=fps)
+    for t in (0.0, 0.5, 1.0, 2.5, 3.9):
+        index = int(t * fps)
+        assert batch[index] == pytest.approx(clip.get_frame(t), abs=1e-3)
+        assert batch[index][0] == pytest.approx(0.1 * t, abs=1e-3)
+    clip.close()
 
 
 if __name__ == "__main__":

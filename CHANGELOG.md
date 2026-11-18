@@ -13,6 +13,9 @@ This mean you need to specifically set `bg_color=None` if you want to generate a
 
 ### Fixed
 - Strongly improve performances to make them more consistent with thoses of v1
+- Fix `FFMPEG_AudioReader.get_frame` returning wrong frames for batch reads
+  spanning more than half of the reader buffer (the recursive split forwarded
+  the boolean `in_time` mask instead of the requested times)
 - Fix circular reference in ImageSequenceClip leading to memory leak
 - Fix TextClip broken with Pillow > 11.2
 - `pixel_format` parameter was ignored when calling ffmpeg writer, as referenced in PR #2359
@@ -20,6 +23,10 @@ This mean you need to specifically set `bg_color=None` if you want to generate a
 
 ### Added
 - Possibility to select audio track when reading a file (#2429)
+- New `afx.DuckVolume` effect: automatically lowers the volume of a clip
+  (e.g. background music) while another audio clip (e.g. a voice-over)
+  contains sound, with configurable threshold, attack, release and hold
+  times
 
 ### Changed 
 - Rewrite FFmpegInfosParser to use indentation and block extractions instead of a state machine (PR #2470)

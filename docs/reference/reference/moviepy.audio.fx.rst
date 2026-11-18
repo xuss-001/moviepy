@@ -48,9 +48,11 @@ moviepy.audio.fx
    moviepy.audio.fx.AudioNormalize
 
 
+   moviepy.audio.fx.DuckVolume
+
+
    moviepy.audio.fx.MultiplyStereoVolume
 
 
    moviepy.audio.fx.MultiplyVolume
-
 
