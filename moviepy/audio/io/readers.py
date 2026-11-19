@@ -1,7 +1,6 @@
 """MoviePy audio reading with ffmpeg."""
 
 import subprocess as sp
-import warnings
 
 import numpy as np
 
@@ -81,6 +80,10 @@ class FFMPEG_AudioReader:
         """Opens the file, creates the pipe."""
         self.close()  # if any
 
+        # The selected audio stream must be mapped on every (re)start of
+        # the ffmpeg process, otherwise seeking backward would silently fall
+        # back to the default stream 0.
+        stream_args = ["-map", "0:a:%d" % self.audio_stream_index]
         if start_time != 0:
             offset = min(1, start_time)
             i_arg = [
@@ -88,14 +91,18 @@ class FFMPEG_AudioReader:
                 "%.05f" % (start_time - offset),
                 "-i",
                 ffmpeg_escape_filename(self.filename),
-                "-map",
-                "0:a:%d" % self.audio_stream_index,
+            ] + stream_args + [
                 "-vn",
                 "-ss",
                 "%.05f" % offset,
             ]
         else:
-            i_arg = ["-i", ffmpeg_escape_filename(self.filename), "-vn"]
+            i_arg = [
+                "-i",
+                ffmpeg_escape_filename(self.filename),
+            ] + stream_args + [
+                "-vn",
+            ]
 
         cmd = (
             [FFMPEG_BINARY]
@@ -204,70 +211,62 @@ class FFMPEG_AudioReader:
           If `tt` is a single float value, the frame corresponding to that
           timestamp is returned. If `tt` is a NumPy array of timestamps, an
           array of frames corresponding to each timestamp is returned.
+
+        Timestamps are returned in the order they are requested in, so the
+        output array keeps the same length as the input (an empty array of
+        times yields an empty array keeping the current number of channels).
+        Duplicated timestamps produce duplicated frames and timestamps outside
+        ``[0, duration)`` produce silent frames. Frames are fetched through
+        the memory buffer with a single sequential pass, so requests made of
+        many repeated or neighbouring times never restart ffmpeg more than
+        necessary and the result does not depend on previous read positions.
         """
         if isinstance(tt, np.ndarray):
-            # lazy implementation, but should not cause problems in
-            # 99.99 %  of the cases
+            result = np.zeros((len(tt), self.nchannels))
 
-            # elements of t that are actually in the range of the
-            # audio file.
+            # An empty array of times returns an empty (0-row) array while
+            # keeping the current number of channels.
+            if len(tt) == 0:
+                return result
+
+            # Elements of tt that are actually in the range of the audio file.
+            # Out-of-range times are left as silent frames in `result`.
             in_time = (tt >= 0) & (tt < self.duration)
-
-            # Check that the requested time is in the valid range
             if not in_time.any():
-                raise IOError(
-                    "Error in file %s, " % (self.filename)
-                    + "Accessing time t=%.02f-%.02f seconds, " % (tt[0], tt[-1])
-                    + "with clip duration=%f seconds, " % self.duration
-                )
-
-            # The np.round in the next line is super-important.
-            # Removing it results in artifacts in the noise.
-            frames = np.round((self.fps * tt)).astype(int)[in_time]
-            fr_min, fr_max = frames.min(), frames.max()
-
-            # if min and max frames don't fit the buffer, it results in IndexError
-            # we avoid that by recursively calling this function on smaller length
-            # and concatenate the results:w
-            max_frame_threshold = fr_min + self.buffersize // 2
-            threshold_idx = np.searchsorted(frames, max_frame_threshold, side="right")
-            if threshold_idx != len(frames):
-                in_time_head = in_time[0:threshold_idx]
-                in_time_tail = in_time[threshold_idx:]
-                return np.concatenate(
-                    [self.get_frame(in_time_head), self.get_frame(in_time_tail)]
-                )
-
-            if not (0 <= (fr_min - self.buffer_startframe) < len(self.buffer)):
-                self.buffer_around(fr_min)
-            elif not (0 <= (fr_max - self.buffer_startframe) < len(self.buffer)):
-                self.buffer_around(fr_max)
-
-            try:
-                result = np.zeros((len(tt), self.nchannels))
-                indices = frames - self.buffer_startframe
-                result[in_time] = self.buffer[indices]
                 return result
 
-            except IndexError as error:
-                warnings.warn(
-                    "Error in file %s, " % (self.filename)
-                    + "At time t=%.02f-%.02f seconds, " % (tt[0], tt[-1])
-                    + "indices wanted: %d-%d, " % (indices.min(), indices.max())
-                    + "but len(buffer)=%d\n" % (len(self.buffer))
-                    + str(error),
-                    UserWarning,
-                )
+            # The np.round is super-important: removing it results in
+            # artifacts in the noise. The same rule is used for single
+            # scalar times, so both code paths always agree.
+            # Non-finite times are out of range and remain silent; masking
+            # them before the cast avoids an undefined integer conversion.
+            safe_times = np.where(in_time, tt, 0.0)
+            frames = np.round(self.fps * safe_times).astype(int)
+            # `duration` may not be an exact number of frames: make sure the
+            # last readable frame never indexes past the end of the buffer.
+            frames = np.minimum(frames, self.n_frames)
 
-                # repeat the last frame instead
-                indices[indices >= len(self.buffer)] = len(self.buffer) - 1
-                result[in_time] = self.buffer[indices]
-                return result
+            # Fetch every distinct frame with a single forward pass through
+            # the buffer. Requests of repeated or adjacent times therefore
+            # reuse the same buffered frames and never restart ffmpeg per
+            # requested time.
+            unique_frames, inverse = np.unique(frames[in_time], return_inverse=True)
+            buffered_frames = np.zeros((len(unique_frames), self.nchannels))
+            for order, frame in enumerate(unique_frames):
+                if not (0 <= (frame - self.buffer_startframe) < len(self.buffer)):
+                    self.buffer_around(frame)
+                buffered_frames[order] = self.buffer[frame - self.buffer_startframe]
 
+            result[in_time] = buffered_frames[inverse]
+            return result
         else:
-            ind = int(self.fps * tt)
-            if ind < 0 or ind > self.n_frames:  # out of time: return 0
+            # Out of time: return silence.
+            if tt < 0 or tt >= self.duration:
                 return np.zeros(self.nchannels)
+
+            # Use the exact same sampling rule as the array path above.
+            ind = int(np.round(self.fps * tt))
+            ind = min(ind, self.n_frames)
 
             if not (0 <= (ind - self.buffer_startframe) < len(self.buffer)):
                 # out of the buffer: recenter the buffer
