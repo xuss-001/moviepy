@@ -20,6 +20,8 @@ This mean you need to specifically set `bg_color=None` if you want to generate a
 
 ### Added
 - Possibility to select audio track when reading a file (#2429)
+- New ``canvas_size`` parameter for ``Rotate`` effect, producing a fixed-size
+  output canvas (with transparent borders) for the whole animation
 
 ### Changed 
 - Rewrite FFmpegInfosParser to use indentation and block extractions instead of a state machine (PR #2470)

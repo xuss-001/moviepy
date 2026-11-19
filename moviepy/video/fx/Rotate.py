@@ -46,8 +46,26 @@ class Rotate(Effect):
     Optional center of rotation (a 2-tuple). Origin is the upper left corner.
 
     bg_color : tuple, optional
-    An optional color for area outside the rotated image. Only has effect if
-    ``expand`` is true.
+        An optional color for area outside the rotated image. Only has effect if
+        ``expand`` is true.
+
+    canvas_size : tuple, optional
+        An optional fixed output canvas size ``(width, height)`` in pixels
+        (both must be positive integers). When provided, every frame of the
+        resulting clip (and of its mask) has exactly this size, whatever the
+        angle, so the animation can be composited into fixed-size videos
+        without jitter or cropping surprises.
+
+        In this mode the top-left corner of the original image matches the
+        top-left corner of the canvas before rotation. The image is first
+        rotated around ``center`` (expressed in the original image
+        coordinates, with the origin at the top-left corner of the image,
+        defaulting to the image center), then translated by ``translate``.
+        Pixels falling outside the canvas are clipped, and empty areas of
+        the canvas stay transparent: ``canvas_size`` takes precedence over
+        ``expand`` and ``bg_color`` is ignored (the clip is given a mask if
+        it does not already have one, so source images without a mask also
+        get proper transparent borders).
     """
 
     angle: float
@@ -57,6 +75,7 @@ class Rotate(Effect):
     center: tuple = None
     translate: tuple = None
     bg_color: tuple = None
+    canvas_size: tuple = None
 
     def rotate_frame(
         self,
@@ -159,6 +178,91 @@ class Rotate(Effect):
 
         return rotated
 
+    def rotate_frame_canvas(
+        self,
+        frame: np.ndarray,
+        angle: float,
+        resample: int,
+        center: Union[tuple, None],
+        translate: Union[tuple, None],
+        canvas_size: tuple,
+    ) -> np.ndarray:
+        """
+        Rotate a single image or mask into a fixed-size canvas using OpenCV.
+
+        The rotation center is expressed in the original frame coordinates
+        (origin at the top-left corner of the frame, defaulting to the frame
+        center). The rotation is followed by an optional translation, and
+        the result is clipped to ``canvas_size``. Areas of the canvas not
+        covered by the rotated frame are left to zero (transparent for
+        masks).
+
+        Parameters
+        ----------
+        frame : np.ndarray
+            HxWxC RGB image (dtype uint8) or HxW mask (any dtype).
+
+        angle : float
+            Counter-clockwise rotation angle in degrees.
+
+        resample : int
+            One of cv2.INTER_NEAREST, cv2.INTER_LINEAR, or cv2.INTER_CUBIC.
+
+        center : tuple or None
+            (cx, cy) rotation center in the original frame pixel coords.
+            Defaults to the frame center.
+
+        translate : tuple or None
+            (dx, dy) post-rotation translation in pixels. Default (0, 0).
+
+        canvas_size : tuple
+            (width, height) of the fixed output canvas.
+
+        Returns
+        -------
+        rotated : np.ndarray
+            The rotated frame or mask, with shape ``(height, width[, C])``.
+        """
+        h, w = frame.shape[:2]
+        canvas_w, canvas_h = canvas_size
+
+        cx, cy = center if center is not None else (w / 2, h / 2)
+
+        rotation_matrix = cv2.getRotationMatrix2D((cx, cy), angle, 1)
+
+        if translate is not None:
+            rotation_matrix[0, 2] += translate[0]
+            rotation_matrix[1, 2] += translate[1]
+
+        return cv2.warpAffine(
+            frame,
+            rotation_matrix,
+            (canvas_w, canvas_h),
+            flags=resample,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+    @staticmethod
+    def _validate_canvas_size(canvas_size) -> tuple:
+        """Validate and normalize the ``canvas_size`` argument."""
+        error_message = (
+            "'canvas_size' argument must be a (width, height) tuple of "
+            "positive integers"
+        )
+        try:
+            width, height = canvas_size
+        except (TypeError, ValueError):
+            raise ValueError(error_message)
+        for dimension in (width, height):
+            if (
+                isinstance(dimension, bool)
+                or not isinstance(dimension, (int, np.integer))
+                or dimension <= 0
+            ):
+                raise ValueError(error_message)
+        return (int(width), int(height))
+
     def apply(self, clip: Clip) -> Clip:
         """Apply the effect to the clip."""
         try:
@@ -172,6 +276,10 @@ class Rotate(Effect):
                 "'resample' argument must be either 'bilinear', 'nearest' or 'bicubic'"
             )
 
+        canvas_size = None
+        if self.canvas_size is not None:
+            canvas_size = self._validate_canvas_size(self.canvas_size)
+
         if hasattr(self.angle, "__call__"):
             get_angle = self.angle
         else:
@@ -183,6 +291,20 @@ class Rotate(Effect):
 
             if self.unit == "rad":
                 angle = math.degrees(angle)
+
+            if canvas_size is not None:
+                if not math.isfinite(angle):
+                    raise ValueError(
+                        "'angle' must be a finite number, got %r" % angle
+                    )
+                return self.rotate_frame_canvas(
+                    im,
+                    angle % 360,
+                    resample,
+                    self.center,
+                    self.translate,
+                    canvas_size,
+                )
 
             angle %= 360
             if not self.center and not self.translate and not self.bg_color:
@@ -206,5 +328,10 @@ class Rotate(Effect):
                 self.translate,
                 self.bg_color,
             )
+
+        if canvas_size is not None and not clip.is_mask and clip.mask is None:
+            # Ensure empty areas of the fixed canvas are transparent even
+            # for source clips without a mask.
+            clip = clip.with_mask()
 
         return clip.transform(filter, apply_to=["mask"])
