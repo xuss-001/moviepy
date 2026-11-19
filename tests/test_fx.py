@@ -809,6 +809,198 @@ def test_resize(apply_to_mask, size, duration, new_size, height, width):
             assert len(mask_frame) == expected_height
 
 
+def make_transparent_icon(size=64, color=(0, 200, 0), hidden=(255, 0, 255)):
+    """Returns an ImageClip of a disc with a semi-transparent edge.
+
+    Fully transparent pixels are filled with a vivid hidden color, like
+    real-world icons exported with unmatted RGB channels.
+    """
+    yy, xx = np.mgrid[0:size, 0:size]
+    center = (size - 1) / 2.0
+    radius = size / 2.0 - 4
+    dist = np.sqrt((xx - center) ** 2 + (yy - center) ** 2)
+    alpha = np.clip(radius + 0.5 - dist, 0.0, 1.0)
+
+    rgb = np.zeros((size, size, 3), dtype="uint8")
+    rgb[:] = hidden
+    rgb[alpha > 0] = color
+
+    clip = ImageClip(rgb, duration=2).with_mask(ImageClip(alpha, is_mask=True))
+    clip.fps = 1
+    return clip
+
+
+@pytest.mark.parametrize("new_size", [(16, 16), (128, 128)])
+def test_resize_preserve_transparency_no_color_bleeding(new_size):
+    """Hidden colors of transparent pixels must not pollute visible edges."""
+    clip = make_transparent_icon()
+
+    resized = clip.with_effects([vfx.Resize(new_size, preserve_transparency=True)])
+    frame = resized.get_frame(0)
+    mask_frame = resized.mask.get_frame(0)
+
+    assert frame.shape == (new_size[1], new_size[0], 3)
+    assert mask_frame.shape == (new_size[1], new_size[0])
+
+    # no invalid values anywhere, including fully transparent regions
+    assert np.isfinite(frame).all()
+    assert np.isfinite(mask_frame).all()
+    assert mask_frame.min() >= 0.0
+    assert mask_frame.max() <= 1.0
+
+    # there are fully transparent, semi-transparent and opaque pixels
+    assert (mask_frame == 0).any()
+    assert ((mask_frame > 0) & (mask_frame < 1)).any()
+    assert (mask_frame == 1).any()
+
+    # fully transparent pixels carry no color and no NaN
+    assert (frame[mask_frame == 0] == 0).all()
+
+    # visible pixels keep the icon color: the hidden magenta (255, 0, 255)
+    # must not bleed into the green (0, 200, 0) disc, even at the edges
+    visible = frame[mask_frame > 0]
+    assert (visible[:, 0] < 80).all()  # red channel stays low
+    assert (visible[:, 2] < 80).all()  # blue channel stays low
+    assert (visible[:, 1] > 120).all()  # green channel stays high
+
+    # the same resize without the protection does show the pollution
+    plain_frame = clip.with_effects([vfx.Resize(new_size)]).get_frame(0)
+    plain_mask = (
+        clip.mask.with_effects([vfx.Resize(new_size, apply_to_mask=False)])
+        .get_frame(0)
+    )
+    plain_visible = plain_frame[plain_mask > 0]
+    assert (plain_visible[:, 0] > 80).any()
+
+
+@pytest.mark.parametrize("background", [(0, 0, 0), (255, 255, 255)])
+def test_resize_preserve_transparency_compositing(background):
+    """Composited on dark/light backgrounds, edges keep their color."""
+    clip = make_transparent_icon()
+    resized = clip.with_effects([vfx.Resize((32, 32), preserve_transparency=True)])
+
+    frame = resized.get_frame(0).astype("float64")
+    mask_frame = resized.mask.get_frame(0)[:, :, np.newaxis]
+    composited = frame * mask_frame + np.array(background) * (1 - mask_frame)
+
+    # semi-transparent edge: a blend of green and the background, no magenta
+    edge = ((mask_frame > 0) & (mask_frame < 1))[:, :, 0]
+    edge_pixels = composited[edge]
+    assert len(edge_pixels) > 0
+    bg = np.array(background, dtype="float64")
+    # red/blue channels of the blend must stay between icon and background
+    low = np.minimum(0, bg[0]) - 1
+    high = np.maximum(0, bg[0]) + 1
+    assert (edge_pixels[:, 0] >= low).all()
+    assert (edge_pixels[:, 0] <= high).all()
+
+
+@pytest.mark.parametrize(
+    "resize_kwargs, expected_sizes",
+    (
+        ({"new_size": (16, 24)}, [(16, 24)]),
+        ({"new_size": 0.5}, [(32, 32)]),
+        ({"new_size": 2.0}, [(128, 128)]),
+        ({"height": 16}, [(16, 16)]),
+        ({"width": 16}, [(16, 16)]),
+        ({"height": lambda t: 16 + 8 * t}, [(16, 16), (24, 24)]),
+        ({"width": lambda t: 16 + 8 * t}, [(16, 16), (24, 24)]),
+        (
+            {"new_size": lambda t: (16 + 8 * t, 24 + 8 * t)},
+            [(16, 24), (24, 32)],
+        ),
+    ),
+)
+def test_resize_preserve_transparency_sizes(resize_kwargs, expected_sizes):
+    """All resizing argument styles are supported, frame and mask agree."""
+    clip = make_transparent_icon()
+    resized = clip.with_effects(
+        [vfx.Resize(preserve_transparency=True, **resize_kwargs)]
+    )
+
+    for t, (expected_w, expected_h) in enumerate(expected_sizes):
+        frame = resized.get_frame(t)
+        mask_frame = resized.mask.get_frame(t)
+        assert frame.shape == (expected_h, expected_w, 3)
+        assert mask_frame.shape == (expected_h, expected_w)
+
+
+def test_resize_preserve_transparency_read_order_consistency():
+    """Frame and mask stay consistent whatever the reading order is."""
+    clip = make_transparent_icon()
+    resized = clip.with_effects(
+        [
+            vfx.Resize(
+                new_size=lambda t: (16 + 8 * t, 16 + 8 * t),
+                preserve_transparency=True,
+            )
+        ]
+    )
+
+    # mask read before the frame, then back and forth in time
+    mask_t1 = resized.mask.get_frame(1)
+    frame_t1 = resized.get_frame(1)
+    mask_t0 = resized.mask.get_frame(0)
+    frame_t0 = resized.get_frame(0)
+    mask_t1_bis = resized.mask.get_frame(1)
+    frame_t1_bis = resized.get_frame(1)
+
+    assert frame_t0.shape[:2] == mask_t0.shape[:2]
+    assert frame_t1.shape[:2] == mask_t1.shape[:2]
+    assert np.array_equal(mask_t1, mask_t1_bis)
+    assert np.array_equal(frame_t1, frame_t1_bis)
+
+
+def test_resize_preserve_transparency_requires_apply_to_mask():
+    clip = make_transparent_icon()
+    with pytest.raises(ValueError):
+        clip.with_effects(
+            [vfx.Resize((16, 16), apply_to_mask=False, preserve_transparency=True)]
+        )
+
+
+def test_resize_preserve_transparency_size_mismatch():
+    """A mask with a different width/height than the frames must raise."""
+    clip = make_transparent_icon()
+    small_mask = ColorClip((32, 32), color=1.0, is_mask=True)
+    clip = clip.with_mask(small_mask)
+    with pytest.raises(ValueError):
+        clip.with_effects([vfx.Resize((16, 16), preserve_transparency=True)])
+
+
+def test_resize_preserve_transparency_without_mask():
+    """Without a mask, frames are processed like a normal resize."""
+    clip = ImageClip(np.zeros((64, 64, 3), dtype="uint8"), duration=1)
+    resized = clip.with_effects([vfx.Resize((16, 16), preserve_transparency=True)])
+    expected = clip.with_effects([vfx.Resize((16, 16))])
+    assert resized.mask is None
+    assert np.array_equal(resized.get_frame(0), expected.get_frame(0))
+
+
+def test_resize_preserve_transparency_default_off():
+    """Not passing the new option keeps the historical behavior."""
+    clip = make_transparent_icon()
+    default = clip.with_effects([vfx.Resize((16, 16))])
+    disabled = clip.with_effects([vfx.Resize((16, 16), preserve_transparency=False)])
+    assert np.array_equal(default.get_frame(0), disabled.get_frame(0))
+    assert np.array_equal(default.mask.get_frame(0), disabled.mask.get_frame(0))
+
+
+def test_resize_preserve_transparency_does_not_alter_source():
+    """The source clip and its mask must be left untouched."""
+    clip = make_transparent_icon()
+    frame_before = clip.get_frame(0).copy()
+    mask_before = clip.mask.get_frame(0).copy()
+
+    resized = clip.with_effects([vfx.Resize((16, 16), preserve_transparency=True)])
+    resized.get_frame(0)
+    resized.mask.get_frame(0)
+
+    assert np.array_equal(clip.get_frame(0), frame_before)
+    assert np.array_equal(clip.mask.get_frame(0), mask_before)
+    assert clip.size == (64, 64)
+
+
 @pytest.mark.parametrize("unit", ["deg", "rad"])
 @pytest.mark.parametrize("resample", ["bilinear", "nearest", "bicubic", "unknown"])
 @pytest.mark.parametrize(

@@ -1129,7 +1129,14 @@ class VideoClip(Clip):
         """
         self.layer_index = index
 
-    def resized(self, new_size=None, height=None, width=None, apply_to_mask=True):
+    def resized(
+        self,
+        new_size=None,
+        height=None,
+        width=None,
+        apply_to_mask=True,
+        preserve_transparency=False,
+    ):
         """Returns a video clip that is a resized version of the clip.
         For info on the parameters, please see ``vfx.Resize``
         """
@@ -1140,6 +1147,7 @@ class VideoClip(Clip):
                     height=height,
                     width=width,
                     apply_to_mask=apply_to_mask,
+                    preserve_transparency=preserve_transparency,
                 )
             ]
         )

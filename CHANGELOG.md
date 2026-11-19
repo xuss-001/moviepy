@@ -20,6 +20,7 @@ This mean you need to specifically set `bg_color=None` if you want to generate a
 
 ### Added
 - Possibility to select audio track when reading a file (#2429)
+- New `preserve_transparency` option for `vfx.Resize` (and `VideoClip.resized`) that rescales RGB frames and mask together using premultiplied alpha, preventing hidden colors of fully transparent pixels from bleeding into visible edges
 
 ### Changed 
 - Rewrite FFmpegInfosParser to use indentation and block extractions instead of a state machine (PR #2470)
